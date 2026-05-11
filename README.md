@@ -1,607 +1,88 @@
-# OpenDomain - 免费二级域名分发平台
+# OpenDomain
 
-<div align="center">
+开源的免费二级域名分发平台，集成 PowerDNS，支持多种 DNS 记录类型管理。
 
-**一个现代化的免费二级域名分发系统，集成 PowerDNS，支持优惠券和邀请机制**
+## 功能
 
-[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
+- 域名注册与管理（实时可用性查询、自动续期）
+- DNS 记录管理（A、AAAA、CNAME、MX、TXT、NS、SRV、CAA）
+- 第三方登录（GitHub、Google、NodeLoc）
+- 优惠券系统（配额券、VIP 券、续期券）
+- 邀请机制与奖励
+- 公告系统
+- 域名健康扫描（DNS、HTTP、SSL、安全检测）
+- 自定义页面管理
+- 管理后台（用户、域名、订单、系统配置）
+- Telegram Bot 通知
+- FOSSBilling 集成（可选）
 
-[功能特性](#功能特性) • [技术架构](#技术架构) • [快速开始](#快速开始) • [文档](#文档) • [路线图](#路线图)
+## 技术栈
 
-</div>
+- **后端**：Go + Gin + PostgreSQL + Redis
+- **前端**：Vue 3 + Vite
+- **DNS**：PowerDNS（MariaDB 后端）
+- **部署**：Docker Compose
 
----
-
-## 📖 项目简介
-
-OpenDomain 是一个开源的二级域名分发平台，允许用户免费注册和管理二级域名，适用于：
-
-- 🎓 学生学习与实验
-- 💻 开发者测试项目
-- 🏢 企业内部服务
-- 🌐 个人博客与网站
-
-### 为什么选择 OpenDomain？
-
-- ✅ **完全免费** - 核心功能永久免费
-- ✅ **易于使用** - 简洁直观的用户界面
-- ✅ **强大灵活** - 支持多种 DNS 记录类型
-- ✅ **高度可扩展** - 模块化设计，易于二次开发
-- ✅ **开源透明** - MIT 协议，社区驱动
-
----
-
-## ✨ 功能特性
-
-### 🎯 核心功能
-
-#### 用户端
-- **域名管理**
-  - 🔍 实时域名可用性查询
-  - 📝 快速域名注册
-  - 🔄 自动/手动续期
-  - 📊 域名使用统计
-
-- **DNS 管理**
-  - ⚡ 支持 A、AAAA、CNAME、MX、TXT、NS、SRV、CAA 记录
-  - 🎛️ 可自定义 TTL
-  - 📥 批量导入/导出 DNS 配置
-  - 🔄 实时同步到 PowerDNS
-
-- **账号系统**
-  - 🔐 邮箱注册/登录
-  - 🌐 第三方登录（GitHub、Google、NodeLoc）
-  - 👤 实名认证（提升配额）
-  - 🏆 用户等级体系
-
-#### 运营功能
-- **优惠券系统**
-  - 🎫 多种优惠券类型（配额券、VIP 券、续期券）
-  - 🎁 灵活的发放机制
-  - 📈 使用统计与分析
-
-- **邀请机制**
-  - 🔗 专属邀请链接
-  - 🎉 自动奖励发放
-  - 📊 邀请排行榜
-  - 💰 阶梯式奖励
-
-#### 新闻公告系统 ✨
-- **公告管理**
-  - 📰 新闻公告发布
-  - 📝 富文本编辑器
-  - 🏷️ 公告分类（系统/功能/维护/活动）
-  - ⭐ 公告置顶与优先级
-  - ⏰ 定时发布
-  - 💬 评论与点赞
-  - 📧 邮件订阅
-  - 🎯 首页轮播展示
-
-#### 域名扫描系统 ✨
-- **全方位扫描**
-  - 🔍 DNS 健康检测
-  - 🌐 HTTP 可访问性检测
-  - 🔒 SSL 证书检测
-  - ⚡ 响应时间监控
-  - 🛡️ 安全漏洞扫描
-  - 📊 内容合规检测
-  - 🚨 恶意链接识别
-- **扫描管理**
-  - ⏱️ 定时扫描任务
-  - 📋 扫描结果公开
-  - 🏆 域名健康排行
-  - 📈 扫描统计仪表板
-  - 🔔 问题自动通知
-
-#### 自定义页面系统 ✨
-- **页面管理**
-  - 📄 自定义页面创建
-  - ✏️ 富文本/Markdown 编辑
-  - 🎨 多种模板选择
-  - 🔄 版本历史与回滚
-  - 🧩 组件化设计
-- **导航管理**
-  - 🧭 顶部/页脚菜单配置
-  - 📂 多级菜单支持
-  - 🔀 拖拽排序
-- **SEO 优化**
-  - 🏷️ Meta 标签管理
-  - 🗺️ Sitemap 生成
-  - 🔍 搜索引擎优化
-
-#### 管理后台
-- **全面的管理功能**
-  - 👥 用户管理
-  - 🌐 根域名管理
-  - 🎫 优惠券管理
-  - 📋 工单处理
-  - 📰 公告管理
-  - 📄 页面管理
-  - 🔍 扫描任务管理
-  - 📊 数据统计
-  - ⚙️ 系统配置
-
-### 🛡️ 安全特性
-
-- 🔒 JWT 认证
-- 🚦 API 限流
-- 🛑 敏感词过滤
-- 📝 操作审计日志
-- 🔐 敏感数据加密
-- 🌐 HTTPS 支持
-
-### 📧 通知系统
-
-- 📮 邮件通知
-- 💬 站内信
-- ⏰ 到期提醒
-- 🎊 奖励通知
-
----
-
-## 🏗️ 技术架构
-
-### 架构图
-
-```
-┌─────────────────────────────────────────────────────┐
-│                   用户层                              │
-│   Web 前台  │  移动端 H5  │  开放 API                │
-└─────────────────────────────────────────────────────┘
-                        ↓
-┌─────────────────────────────────────────────────────┐
-│                 接入层（Nginx）                       │
-└─────────────────────────────────────────────────────┘
-                        ↓
-┌─────────────────────────────────────────────────────┐
-│                应用层（微服务）                        │
-│  用户服务 │ 域名服务 │ DNS服务 │ 优惠券服务 │ 通知服务 │
-└─────────────────────────────────────────────────────┘
-                        ↓
-┌─────────────────────────────────────────────────────┐
-│              中间件层                                 │
-│    Redis   │   RabbitMQ   │   定时任务               │
-└─────────────────────────────────────────────────────┘
-                        ↓
-┌─────────────────────────────────────────────────────┐
-│                数据层                                 │
-│    MySQL   │   PowerDNS   │   对象存储               │
-└─────────────────────────────────────────────────────┘
-```
-
-### 技术栈
-
-**后端**
-- 🚀 **语言**: Go 1.21+
-- ⚡ **框架**: Gin
-- 💾 **数据库**: PostgreSQL 15+
-- 🔴 **缓存**: Redis 7.x
-- 📨 **任务队列**: Asynq (Redis-based)
-- 🌐 **DNS**: PowerDNS
-- 📝 **ORM**: GORM
-- 🔐 **认证**: golang-jwt/jwt
-
-**前端**
-- ⚡ **框架**: Vue 3 + TypeScript
-- 🎨 **UI 库**: Element Plus
-- 📦 **状态管理**: Pinia
-- 🛠️ **构建工具**: Vite
-- 🌐 **HTTP 客户端**: Axios
-- ✏️ **富文本编辑器**: TinyMCE / Quill
-- 📝 **Markdown 编辑器**: vditor
-
-**DevOps**
-- 🐳 **容器化**: Docker + Docker Compose
-- 📊 **监控**: Prometheus + Grafana
-- 📝 **日志**: Zap / Logrus
-- 🔄 **CI/CD**: GitHub Actions / GitLab CI
-
----
-
-## 🚀 快速开始
+## 部署
 
 ### 前置要求
 
-- Go >= 1.21
-- PostgreSQL >= 15
-- Redis >= 7.0
-- Docker & Docker Compose（推荐）
+- Docker & Docker Compose
 
-### 方式一：Docker 部署（推荐）
+### 一键部署
 
 ```bash
-# 1. 克隆项目
-git clone https://github.com/your-username/opendomain.git
+git clone https://github.com/nodeloc/opendomain.git
 cd opendomain
 
-# 2. 配置环境变量
 cp .env.example .env
-# 编辑 .env 文件，配置数据库、Redis 等信息
+# 编辑 .env，至少修改以下变量：
+# DB_PASSWORD、JWT_SECRET、POWERDNS_API_KEY、PDNS_DB_PASSWORD、PDNS_ADMIN_SECRET
 
-# 3. 启动所有服务
-docker-compose up -d
-
-# 4. 初始化数据库
-docker-compose exec backend npm run db:migrate
-docker-compose exec backend npm run db:seed
-
-# 5. 访问应用
-# 前台: http://localhost:3000
-# 后台: http://localhost:3000/admin
-# API: http://localhost:8000/api
+./docker-deploy.sh
 ```
 
-### 方式二：本地开发
+部署完成后访问：
 
-#### 后端启动
+| 服务 | 地址 |
+|------|------|
+| API 后端 | http://localhost:8000 |
+| PowerDNS Admin | http://localhost:9191 |
+| PowerDNS API | http://localhost:8081 |
+
+### 服务说明
+
+`docker-compose.yml` 包含以下服务：
+
+- `postgres` — OpenDomain 应用数据库
+- `redis` — 缓存
+- `pdns-db` — PowerDNS 专用 MariaDB
+- `powerdns` — 权威 DNS 服务器，暴露 53 端口
+- `pdns-admin` — PowerDNS Web 管理面板
+- `migrate` — 自动执行数据库迁移
+- `app` — OpenDomain 后端应用
+
+### 常用命令
 
 ```bash
-# 1. 克隆项目
-git clone https://github.com/your-username/opendomain.git
-cd opendomain
+# 查看日志
+docker compose logs -f
 
-# 2. 安装 Go 依赖
-go mod download
+# 查看应用日志
+docker compose logs -f app
 
-# 3. 配置环境变量
-cp .env.example .env
-# 编辑 .env 配置数据库连接信息
+# 重启服务
+docker compose restart
 
-# 4. 运行数据库迁移
-make migrate-up
-
-# 5. 启动 API 服务
-make run
-# 或者直接运行
-go run cmd/api/main.go
-
-# 后端运行在 http://localhost:8000
+# 停止并删除容器
+docker compose down
 ```
 
-#### 前端启动
+### 注意事项
 
-```bash
-# 1. 进入前端目录
-cd frontend
+- 53 端口在 Ubuntu 上可能被 `systemd-resolved` 占用，可在 `.env` 中设置 `DNS_PORT=5353` 改用其他端口
+- 首次访问 PowerDNS Admin（`:9191`）需注册管理员账号，API URL 填 `http://powerdns:8081`
 
-# 2. 安装依赖
-npm install
+## 许可证
 
-# 3. 配置环境变量
-cp .env.example .env
-
-# 4. 启动开发服务器
-npm run dev
-
-# 前端运行在 http://localhost:3000
-```
-
-### PowerDNS 配置
-
-```bash
-# 1. 安装 PowerDNS
-# Ubuntu/Debian
-sudo apt-get install pdns-server pdns-backend-mysql
-
-# 2. 配置 PowerDNS
-sudo vi /etc/powerdns/pdns.conf
-
-# 添加以下配置
-api=yes
-api-key=your-secret-api-key
-webserver=yes
-webserver-address=0.0.0.0
-webserver-port=8081
-
-# 3. 重启 PowerDNS
-sudo systemctl restart pdns
-
-# 4. 在 .env 中配置 PowerDNS API
-POWERDNS_API_URL=http://localhost:8081
-POWERDNS_API_KEY=your-secret-api-key
-```
-
----
-
-## 📚 文档
-
-详细文档请查看以下文件：
-
-- 📋 [需求文档](REQUIREMENTS.md) - 完整的功能需求说明
-- 🏗️ [架构设计](ARCHITECTURE.md) - 技术架构和实现方案
-- 💾 [数据库设计](DATABASE.md) - 数据库表结构和说明
-- 🗺️ [开发路线图](ROADMAP.md) - 项目规划和里程碑
-
-### API 文档
-
-启动后端服务后，访问 Swagger 文档：
-
-```
-http://localhost:8000/api/docs
-```
-
----
-
-## 🗺️ 路线图
-
-### ✅ Phase 1: 基础架构（已完成）
-- [x] 项目规划与文档
-- [ ] 用户认证系统
-- [ ] 基础后台管理
-
-### 🚧 Phase 2: 核心功能（进行中）
-- [ ] 域名注册与管理
-- [ ] DNS 记录管理
-- [ ] PowerDNS 集成
-
-### 📅 Phase 3: 运营功能（计划中）
-- [ ] 优惠券系统
-- [ ] 邀请机制
-- [ ] 通知系统
-
-### 🔮 Phase 4: 高级功能（未来）
-- [ ] 开放 API
-- [ ] 域名监控
-- [ ] 域名市场
-
-详细路线图请查看 [ROADMAP.md](ROADMAP.md)
-
----
-
-## 🤝 贡献指南
-
-我们欢迎所有形式的贡献！
-
-### 如何贡献
-
-1. Fork 本仓库
-2. 创建您的特性分支 (`git checkout -b feature/AmazingFeature`)
-3. 提交您的更改 (`git commit -m 'Add some AmazingFeature'`)
-4. 推送到分支 (`git push origin feature/AmazingFeature`)
-5. 开启一个 Pull Request
-
-### 开发规范
-
-- 遵循 ESLint 代码规范
-- 编写清晰的提交信息
-- 为新功能添加测试
-- 更新相关文档
-
-详细信息请查看 [CONTRIBUTING.md](CONTRIBUTING.md)
-
----
-
-## 📝 项目结构
-
-```
-OpenDomain/
-├── cmd/                        # 应用程序入口
-│   ├── api/                   # API 服务
-│   │   └── main.go
-│   ├── worker/                # 后台任务
-│   │   └── main.go
-│   └── scanner/               # 域名扫描服务
-│       └── main.go
-├── internal/                   # 内部包（不可被外部引用）
-│   ├── config/                # 配置管理
-│   ├── models/                # 数据模型
-│   ├── repository/            # 数据访问层
-│   ├── service/               # 业务逻辑层
-│   │   ├── user/
-│   │   ├── domain/
-│   │   ├── dns/
-│   │   ├── coupon/
-│   │   ├── invitation/
-│   │   ├── announcement/      # 公告服务
-│   │   ├── page/              # 自定义页面服务
-│   │   └── scanner/           # 域名扫描服务
-│   ├── handler/               # HTTP 处理器
-│   ├── middleware/            # 中间件
-│   ├── pkg/                   # 内部工具包
-│   └── router/                # 路由配置
-├── pkg/                       # 公共库（可被外部引用）
-│   ├── powerdns/             # PowerDNS 客户端
-│   ├── email/                # 邮件服务
-│   └── utils/                # 通用工具
-├── web/                      # 前端代码
-│   ├── src/
-│   │   ├── views/           # 页面组件
-│   │   ├── components/      # 通用组件
-│   │   ├── stores/          # 状态管理
-│   │   ├── router/          # 路由配置
-│   │   ├── api/             # API 请求
-│   │   └── utils/           # 工具函数
-│   └── package.json
-├── migrations/               # 数据库迁移
-│   ├── 000001_init_schema.up.sql
-│   └── 000001_init_schema.down.sql
-├── scripts/                  # 脚本工具
-├── deploy/                   # 部署配置
-│   ├── docker/
-│   └── k8s/
-├── docs/                     # 文档
-│   ├── swagger/             # API 文档
-│   ├── REQUIREMENTS.md      # 需求文档
-│   ├── ARCHITECTURE.md      # 架构设计
-│   ├── DATABASE.md          # 数据库设计
-│   ├── ROADMAP.md           # 路线图
-│   ├── GO_STACK.md          # Go 技术栈
-│   └── FEATURES.md          # 功能清单
-├── .env.example
-├── .gitignore
-├── Dockerfile
-├── docker-compose.yml
-├── Makefile
-├── go.mod
-├── go.sum
-└── README.md
-```
-
----
-
-## 🔧 配置说明
-
-### 环境变量
-
-#### 后端 (.env)
-
-```env
-# 应用配置
-APP_ENV=development
-PORT=8000
-LOG_LEVEL=debug
-
-# 数据库（PostgreSQL）
-DB_HOST=localhost
-DB_PORT=5432
-DB_USER=postgres
-DB_PASSWORD=your_password
-DB_NAME=opendomain
-DB_SSL_MODE=disable
-
-# Redis
-REDIS_HOST=localhost
-REDIS_PORT=6379
-REDIS_PASSWORD=
-REDIS_DB=0
-
-# JWT
-JWT_SECRET=your-jwt-secret-key-change-this
-JWT_EXPIRES_IN=2  # hours
-
-# PowerDNS
-POWERDNS_API_URL=http://localhost:8081
-POWERDNS_API_KEY=your-api-key
-
-# 邮件服务
-MAIL_HOST=smtp.gmail.com
-MAIL_PORT=587
-MAIL_USER=your-email@gmail.com
-MAIL_PASSWORD=your-password
-MAIL_FROM=noreply@opendomain.com
-
-# OAuth (可选)
-GITHUB_CLIENT_ID=
-GITHUB_CLIENT_SECRET=
-GOOGLE_CLIENT_ID=
-GOOGLE_CLIENT_SECRET=
-
-# 扫描配置
-SCANNER_CONCURRENCY=10
-SCANNER_TIMEOUT=30  # seconds
-```
-
-#### 前端 (.env)
-
-```env
-VITE_API_BASE_URL=http://localhost:8000/api
-VITE_APP_TITLE=OpenDomain
-```
-
----
-
-## 🧪 测试
-
-```bash
-# 后端单元测试
-cd backend
-npm run test
-
-# 后端 E2E 测试
-npm run test:e2e
-
-# 前端单元测试
-cd frontend
-npm run test
-
-# 测试覆盖率
-npm run test:cov
-```
-
----
-
-## 📊 性能指标
-
-### 目标性能
-
-- ⚡ API 响应时间: < 200ms (P95)
-- 🚀 DNS 记录同步: < 5s
-- 💾 数据库查询: < 100ms
-- 🔄 并发支持: 1000+ QPS
-
-### 优化措施
-
-- Redis 缓存热点数据
-- 数据库索引优化
-- 异步任务队列
-- CDN 静态资源加速
-
----
-
-## 🛡️ 安全
-
-### 安全措施
-
-- 🔒 密码加密存储（bcrypt）
-- 🔐 JWT Token 认证
-- 🚦 API 请求限流
-- 🛑 SQL 注入防护
-- 🌐 XSS/CSRF 防护
-- 📝 操作日志审计
-
-### 报告安全问题
-
-如果您发现安全漏洞，请发送邮件至 security@opendomain.local，请勿公开披露。
-
----
-
-## 📄 许可证
-
-本项目采用 [MIT](LICENSE) 许可证。
-
----
-
-## 💬 社区与支持
-
-### 交流讨论
-
-- GitHub Discussions
-- QQ 群: 123456789
-- Telegram: @opendomain
-
----
-
-## 🌟 Star History
-
-[![Star History Chart](https://api.star-history.com/svg?repos=nodeloc/opendomain&type=Date)](https://star-history.com/#nodeloc/opendomain&Date)
-
----
-
-## 👏 致谢
-
-感谢所有为 OpenDomain 做出贡献的开发者！
-
-特别感谢以下开源项目：
-
-- [NestJS](https://nestjs.com/)
-- [Vue.js](https://vuejs.org/)
-- [PowerDNS](https://www.powerdns.com/)
-- [Element Plus](https://element-plus.org/)
-
----
-
-## 📮 联系我们
-
-- 🌐 官网: https://www.nodeloc.com
-- 💼 GitHub: [@opendomain](https://github.com/nodeloc)
-
----
-
-<div align="center">
-
-**如果这个项目对您有帮助，请给我们一个 ⭐️**
-
-Made with ❤️ by NodeLoc Team
-
-</div>
+[MIT](LICENSE)
