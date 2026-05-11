@@ -1,5 +1,5 @@
 services:
-  # PostgreSQL 数据库
+  # PostgreSQL 数据库（OpenDomain 应用）
   postgres:
     image: postgres:15-alpine
     container_name: opendomain-postgres
@@ -39,7 +39,82 @@ services:
     networks:
       - opendomain-network
 
-  # 数据库迁移（初始化）
+  # MariaDB 数据库（PowerDNS 专用）
+  pdns-db:
+    image: mariadb:10.5
+    container_name: opendomain-pdns-db
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${PDNS_DB_ROOT_PASSWORD:-pdnsrootpass}
+      MYSQL_DATABASE: ${PDNS_DB_NAME:-pdns}
+      MYSQL_USER: ${PDNS_DB_USER:-pdns}
+      MYSQL_PASSWORD: ${PDNS_DB_PASSWORD:-pdnspass}
+    volumes:
+      - pdns_db_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "--password=${PDNS_DB_ROOT_PASSWORD:-pdnsrootpass}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - opendomain-network
+
+  # PowerDNS 权威 DNS 服务器
+  powerdns:
+    image: pschiffe/pdns-mysql:latest
+    container_name: opendomain-powerdns
+    restart: unless-stopped
+    depends_on:
+      pdns-db:
+        condition: service_healthy
+    environment:
+      PDNS_gmysql_host: pdns-db
+      PDNS_gmysql_user: ${PDNS_DB_USER:-pdns}
+      PDNS_gmysql_password: ${PDNS_DB_PASSWORD:-pdnspass}
+      PDNS_gmysql_dbname: ${PDNS_DB_NAME:-pdns}
+      PDNS_api: "yes"
+      PDNS_api_key: ${POWERDNS_API_KEY:-changeme-pdns-api-key}
+      PDNS_webserver: "yes"
+      PDNS_webserver_address: "0.0.0.0"
+      PDNS_webserver_allow_from: "0.0.0.0/0"
+      PDNS_resolver: "8.8.8.8"
+      PDNS_expand-alias: "yes"
+      PDNS_gmysql_dnssec: "yes"
+      PDNS_enable-lua-records: "yes"
+    ports:
+      - "${DNS_PORT:-53}:53/udp"
+      - "${DNS_PORT:-53}:53/tcp"
+      - "${PDNS_API_PORT:-8081}:8081"
+    healthcheck:
+      test: ["CMD", "pdns_control", "ping"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks:
+      - opendomain-network
+
+  # PowerDNS Admin 管理面板
+  pdns-admin:
+    image: powerdnsadmin/pda-legacy:latest
+    container_name: opendomain-pdns-admin
+    restart: unless-stopped
+    depends_on:
+      pdns-db:
+        condition: service_healthy
+      powerdns:
+        condition: service_healthy
+    ports:
+      - "${PDNS_ADMIN_PORT:-9191}:80"
+    environment:
+      SECRET_KEY: ${PDNS_ADMIN_SECRET:-changeme-pdns-admin-secret}
+      SQLALCHEMY_DATABASE_URI: "mysql://${PDNS_DB_USER:-pdns}:${PDNS_DB_PASSWORD:-pdnspass}@pdns-db/${PDNS_DB_NAME:-pdns}"
+    volumes:
+      - pdns_admin_data:/data
+    networks:
+      - opendomain-network
+
+  # 数据库迁移（初始化 OpenDomain 表结构）
   migrate:
     image: migrate/migrate:latest
     container_name: opendomain-migrate
@@ -72,6 +147,8 @@ services:
         condition: service_healthy
       migrate:
         condition: service_completed_successfully
+      powerdns:
+        condition: service_healthy
     ports:
       - "${PORT:-8000}:8000"
     environment:
@@ -80,11 +157,11 @@ services:
       PORT: ${PORT:-8000}
       LOG_LEVEL: ${LOG_LEVEL:-info}
       FRONTEND_URL: ${FRONTEND_URL:-http://localhost:3001}
-      
+
       # 站点配置
       SITE_NAME: ${SITE_NAME:-OpenDomain}
       SITE_DESCRIPTION: ${SITE_DESCRIPTION:-Free Domain Registration Platform}
-      
+
       # 数据库配置（连接到 postgres 服务）
       DB_HOST: postgres
       DB_PORT: 5432
@@ -92,28 +169,28 @@ services:
       DB_PASSWORD: ${DB_PASSWORD:-opendomain123}
       DB_NAME: ${DB_NAME:-opendomain}
       DB_SSL_MODE: disable
-      
+
       # Redis 配置（连接到 redis 服务）
       REDIS_HOST: redis
       REDIS_PORT: 6379
       REDIS_PASSWORD: ${REDIS_PASSWORD:-}
       REDIS_DB: ${REDIS_DB:-0}
-      
+
       # JWT 配置
       JWT_SECRET: ${JWT_SECRET:-change-this-secret-key}
       JWT_EXPIRES_IN: ${JWT_EXPIRES_IN:-2}
-      
-      # PowerDNS 配置
-      POWERDNS_API_URL: ${POWERDNS_API_URL:-http://host.docker.internal:8081}
-      POWERDNS_API_KEY: ${POWERDNS_API_KEY:-}
-      
+
+      # PowerDNS 配置（连接到内部 powerdns 服务）
+      POWERDNS_API_URL: http://powerdns:8081
+      POWERDNS_API_KEY: ${POWERDNS_API_KEY:-changeme-pdns-api-key}
+
       # 邮件配置
       MAIL_HOST: ${MAIL_HOST:-}
       MAIL_PORT: ${MAIL_PORT:-587}
       MAIL_USER: ${MAIL_USER:-}
       MAIL_PASSWORD: ${MAIL_PASSWORD:-}
       MAIL_FROM: ${MAIL_FROM:-noreply@opendomain.com}
-      
+
       # OAuth 配置
       GITHUB_CLIENT_ID: ${GITHUB_CLIENT_ID:-}
       GITHUB_CLIENT_SECRET: ${GITHUB_CLIENT_SECRET:-}
@@ -121,27 +198,27 @@ services:
       GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
       NODELOC_CLIENT_ID: ${NODELOC_CLIENT_ID:-}
       NODELOC_CLIENT_SECRET: ${NODELOC_CLIENT_SECRET:-}
-      
+
       # 扫描器配置
       SCANNER_CONCURRENCY: ${SCANNER_CONCURRENCY:-10}
       SCANNER_TIMEOUT: ${SCANNER_TIMEOUT:-30}
-      
+
       # 安全扫描 API
       GOOGLE_SAFE_BROWSING_KEY: ${GOOGLE_SAFE_BROWSING_KEY:-}
       VIRUSTOTAL_API_KEY: ${VIRUSTOTAL_API_KEY:-}
-      
+
       # 默认 NS
       DEFAULT_NS1: ${DEFAULT_NS1:-ns1.example.com}
       DEFAULT_NS2: ${DEFAULT_NS2:-ns2.example.com}
-      
+
       # NodeLoc 支付
       NODELOC_PAYMENT_ID: ${NODELOC_PAYMENT_ID:-}
       NODELOC_SECRET_KEY: ${NODELOC_SECRET_KEY:-}
-      
+
       # Telegram Bot
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       TELEGRAM_CHANNEL_ID: ${TELEGRAM_CHANNEL_ID:-}
-      
+
       # FOSSBilling 集成
       FOSSBILLING_ENABLED: ${FOSSBILLING_ENABLED:-false}
       FOSSBILLING_URL: ${FOSSBILLING_URL:-}
@@ -162,6 +239,10 @@ volumes:
   postgres_data:
     driver: local
   redis_data:
+    driver: local
+  pdns_db_data:
+    driver: local
+  pdns_admin_data:
     driver: local
 
 networks:
