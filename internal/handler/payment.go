@@ -883,41 +883,24 @@ func (h *PaymentHandler) createDomainFromOrder(tx *gorm.DB, order *models.Order)
 		DNSSynced:             false,
 	}
 
-	// 用 savepoint 包裹 INSERT：若触发唯一约束冲突，回滚到 savepoint
-	// 后再查软删除记录并恢复，避免事务进入 aborted 状态（PostgreSQL 25P02）
-	if err := tx.Exec("SAVEPOINT create_domain").Error; err != nil {
-		return fmt.Errorf("failed to create savepoint: %w", err)
-	}
-	createErr := tx.Create(domain).Error
-	if createErr != nil {
-		// 先回滚到 savepoint，恢复事务可用状态
-		if rbErr := tx.Exec("ROLLBACK TO SAVEPOINT create_domain").Error; rbErr != nil {
-			return fmt.Errorf("failed to rollback to savepoint: %w", rbErr)
+	// 先检查是否存在软删除记录，存在则直接恢复（partial index 已保证软删除记录不占唯一约束）
+	var softDeleted models.Domain
+	if dbErr := tx.Unscoped().Where("full_domain = ? AND deleted_at IS NOT NULL", domain.FullDomain).First(&softDeleted).Error; dbErr == nil {
+		// 恢复软删除记录
+		if restoreErr := tx.Unscoped().Model(&softDeleted).Updates(map[string]interface{}{
+			"deleted_at":    nil,
+			"user_id":       domain.UserID,
+			"status":        domain.Status,
+			"expires_at":    domain.ExpiresAt,
+			"registered_at": domain.RegisteredAt,
+		}).Error; restoreErr != nil {
+			return fmt.Errorf("failed to restore domain %s: %w", domain.FullDomain, restoreErr)
 		}
-		// 如果是唯一约束冲突（域名已被软删除），尝试恢复该记录
-		if strings.Contains(createErr.Error(), "duplicate key") || strings.Contains(createErr.Error(), "unique constraint") {
-			var softDeleted models.Domain
-			if dbErr := tx.Unscoped().Where("full_domain = ?", domain.FullDomain).First(&softDeleted).Error; dbErr == nil {
-				if restoreErr := tx.Unscoped().Model(&softDeleted).Updates(map[string]interface{}{
-					"deleted_at":    nil,
-					"user_id":       domain.UserID,
-					"status":        domain.Status,
-					"expires_at":    domain.ExpiresAt,
-					"registered_at": domain.RegisteredAt,
-				}).Error; restoreErr != nil {
-					return fmt.Errorf("failed to restore domain %s: %w", domain.FullDomain, restoreErr)
-				}
-				domain.ID = softDeleted.ID
-			} else {
-				return fmt.Errorf("failed to create domain %s: %w", domain.FullDomain, createErr)
-			}
-		} else {
-			return createErr
-		}
+		domain.ID = softDeleted.ID
 	} else {
-		// INSERT 成功，释放 savepoint
-		if err := tx.Exec("RELEASE SAVEPOINT create_domain").Error; err != nil {
-			return fmt.Errorf("failed to release savepoint: %w", err)
+		// 不存在软删除记录，正常创建
+		if err := tx.Create(domain).Error; err != nil {
+			return fmt.Errorf("failed to create domain %s: %w", domain.FullDomain, err)
 		}
 	}
 
