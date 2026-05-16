@@ -886,13 +886,22 @@ func (h *PaymentHandler) createDomainFromOrder(tx *gorm.DB, order *models.Order)
 	// 先检查是否存在软删除记录，存在则直接恢复（partial index 已保证软删除记录不占唯一约束）
 	var softDeleted models.Domain
 	if dbErr := tx.Unscoped().Where("full_domain = ? AND deleted_at IS NOT NULL", domain.FullDomain).First(&softDeleted).Error; dbErr == nil {
-		// 恢复软删除记录
+		// 恢复软删除记录，同时清除历史挂起/失败状态，避免 scanner 误判
 		if restoreErr := tx.Unscoped().Model(&softDeleted).Updates(map[string]interface{}{
-			"deleted_at":    nil,
-			"user_id":       domain.UserID,
-			"status":        domain.Status,
-			"expires_at":    domain.ExpiresAt,
-			"registered_at": domain.RegisteredAt,
+			"deleted_at":              nil,
+			"user_id":                 domain.UserID,
+			"status":                  domain.Status,
+			"expires_at":              domain.ExpiresAt,
+			"registered_at":           domain.RegisteredAt,
+			"auto_renew":              domain.AutoRenew,
+			"nameservers":             domain.Nameservers,
+			"use_default_nameservers": domain.UseDefaultNameservers,
+			"dns_synced":              false,
+			"dns_sync_error":          nil,
+			// 清除历史挂起/失败记录，防止 scanner 按旧时间戳触发自动删除
+			"first_failed_at":         nil,
+			"suspended_at":            nil,
+			"suspend_reason":          nil,
 		}).Error; restoreErr != nil {
 			return fmt.Errorf("failed to restore domain %s: %w", domain.FullDomain, restoreErr)
 		}
