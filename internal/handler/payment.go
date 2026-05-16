@@ -883,9 +883,19 @@ func (h *PaymentHandler) createDomainFromOrder(tx *gorm.DB, order *models.Order)
 		DNSSynced:             false,
 	}
 
-	if err := tx.Create(domain).Error; err != nil {
+	// 用 savepoint 包裹 INSERT：若触发唯一约束冲突，回滚到 savepoint
+	// 后再查软删除记录并恢复，避免事务进入 aborted 状态（PostgreSQL 25P02）
+	if err := tx.Exec("SAVEPOINT create_domain").Error; err != nil {
+		return fmt.Errorf("failed to create savepoint: %w", err)
+	}
+	createErr := tx.Create(domain).Error
+	if createErr != nil {
+		// 先回滚到 savepoint，恢复事务可用状态
+		if rbErr := tx.Exec("ROLLBACK TO SAVEPOINT create_domain").Error; rbErr != nil {
+			return fmt.Errorf("failed to rollback to savepoint: %w", rbErr)
+		}
 		// 如果是唯一约束冲突（域名已被软删除），尝试恢复该记录
-		if strings.Contains(err.Error(), "duplicate key") || strings.Contains(err.Error(), "unique constraint") {
+		if strings.Contains(createErr.Error(), "duplicate key") || strings.Contains(createErr.Error(), "unique constraint") {
 			var softDeleted models.Domain
 			if dbErr := tx.Unscoped().Where("full_domain = ?", domain.FullDomain).First(&softDeleted).Error; dbErr == nil {
 				if restoreErr := tx.Unscoped().Model(&softDeleted).Updates(map[string]interface{}{
@@ -899,10 +909,15 @@ func (h *PaymentHandler) createDomainFromOrder(tx *gorm.DB, order *models.Order)
 				}
 				domain.ID = softDeleted.ID
 			} else {
-				return fmt.Errorf("failed to create domain %s: %w", domain.FullDomain, err)
+				return fmt.Errorf("failed to create domain %s: %w", domain.FullDomain, createErr)
 			}
 		} else {
-			return err
+			return createErr
+		}
+	} else {
+		// INSERT 成功，释放 savepoint
+		if err := tx.Exec("RELEASE SAVEPOINT create_domain").Error; err != nil {
+			return fmt.Errorf("failed to release savepoint: %w", err)
 		}
 	}
 
