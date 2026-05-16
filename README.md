@@ -37,18 +37,25 @@ cd opendomain
 
 cp .env.example .env
 # 编辑 .env，至少修改以下变量：
-# DB_PASSWORD、JWT_SECRET、POWERDNS_API_KEY、PDNS_DB_PASSWORD、PDNS_ADMIN_SECRET
+# DB_PASSWORD、JWT_SECRET、POWERDNS_API_KEY
 
 ./docker-deploy.sh
 ```
 
+如果需要同时启动内置 PowerDNS，使用 `powerdns` profile：
+
+```bash
+# 额外修改 .env 中的 PDNS_DB_PASSWORD、PDNS_ADMIN_SECRET
+docker compose --profile powerdns up -d
+```
+
 部署完成后访问：
 
-| 服务 | 地址 |
-|------|------|
-| API 后端 | http://localhost:8000 |
-| PowerDNS Admin | http://localhost:9191 |
-| PowerDNS API | http://localhost:8081 |
+| 服务 | 地址 | 说明 |
+|------|------|------|
+| API 后端 | http://localhost:8000 | 默认启用 |
+| PowerDNS Admin | http://localhost:9191 | 需启用 powerdns profile |
+| PowerDNS API | http://localhost:8081 | 需启用 powerdns profile |
 
 ### 服务说明
 
@@ -56,11 +63,11 @@ cp .env.example .env
 
 - `postgres` — OpenDomain 应用数据库
 - `redis` — 缓存
-- `pdns-db` — PowerDNS 专用 MariaDB
-- `powerdns` — 权威 DNS 服务器，暴露 53 端口
-- `pdns-admin` — PowerDNS Web 管理面板
 - `migrate` — 自动执行数据库迁移
 - `app` — OpenDomain 后端应用
+- `pdns-db` — PowerDNS 专用 MariaDB（`powerdns` profile）
+- `powerdns` — 权威 DNS 服务器，暴露 53 端口（`powerdns` profile）
+- `pdns-admin` — PowerDNS Web 管理面板（`powerdns` profile）
 
 ### 常用命令
 

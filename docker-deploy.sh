@@ -187,6 +187,9 @@ show_status() {
     echo "  进入容器: $DOCKER_COMPOSE exec app sh"
     echo "  复制前端: docker cp opendomain-app:/app/web/dist/. ./public/"
     echo ""
+    echo "启用内置 PowerDNS（可选）："
+    echo "  $DOCKER_COMPOSE --profile powerdns up -d"
+    echo ""
 }
 
 # 查看日志

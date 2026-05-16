@@ -40,10 +40,12 @@ services:
       - opendomain-network
 
   # MariaDB 数据库（PowerDNS 专用）
+  # 启用方式: docker compose --profile powerdns up -d
   pdns-db:
     image: mariadb:10.5
     container_name: opendomain-pdns-db
     restart: unless-stopped
+    profiles: [powerdns]
     environment:
       MYSQL_ROOT_PASSWORD: ${PDNS_DB_ROOT_PASSWORD:-pdnsrootpass}
       MYSQL_DATABASE: ${PDNS_DB_NAME:-pdns}
@@ -60,10 +62,12 @@ services:
       - opendomain-network
 
   # PowerDNS 权威 DNS 服务器
+  # 启用方式: docker compose --profile powerdns up -d
   powerdns:
     image: pschiffe/pdns-mysql:latest
     container_name: opendomain-powerdns
     restart: unless-stopped
+    profiles: [powerdns]
     depends_on:
       pdns-db:
         condition: service_healthy
@@ -95,10 +99,12 @@ services:
       - opendomain-network
 
   # PowerDNS Admin 管理面板
+  # 启用方式: docker compose --profile powerdns up -d
   pdns-admin:
     image: powerdnsadmin/pda-legacy:latest
     container_name: opendomain-pdns-admin
     restart: unless-stopped
+    profiles: [powerdns]
     depends_on:
       pdns-db:
         condition: service_healthy
@@ -147,8 +153,6 @@ services:
         condition: service_healthy
       migrate:
         condition: service_completed_successfully
-      powerdns:
-        condition: service_healthy
     ports:
       - "${PORT:-8000}:8000"
     environment:
