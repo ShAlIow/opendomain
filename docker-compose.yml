@@ -184,8 +184,8 @@ services:
       JWT_SECRET: ${JWT_SECRET:-change-this-secret-key}
       JWT_EXPIRES_IN: ${JWT_EXPIRES_IN:-2}
 
-      # PowerDNS 配置（连接到内部 powerdns 服务）
-      POWERDNS_API_URL: http://powerdns:8081
+      # PowerDNS 配置（外部 PowerDNS 填实际地址；内置 PowerDNS 用 http://powerdns:8081）
+      POWERDNS_API_URL: ${POWERDNS_API_URL:-http://powerdns:8081}
       POWERDNS_API_KEY: ${POWERDNS_API_KEY:-changeme-pdns-api-key}
 
       # 邮件配置
