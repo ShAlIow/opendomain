@@ -676,6 +676,124 @@ func (e *DelegationErrors) Error() string {
 	return fmt.Sprintf("%d delegation(s) failed in %s: %s", len(e.Failures), e.Parent, strings.Join(msgs, "; "))
 }
 
+// toggleRRsets re-publishes the given RRsets with every record's disabled
+// flag set to `disabled`, in batches.
+func (c *Client) toggleRRsets(zoneName string, rrsets []RRset, disabled bool) error {
+	var patches []RRset
+	for _, rrset := range rrsets {
+		records := make([]Record, len(rrset.Records))
+		for i, r := range rrset.Records {
+			records[i] = Record{Content: r.Content, Disabled: disabled}
+		}
+		patches = append(patches, RRset{
+			Name: rrset.Name, Type: rrset.Type, TTL: rrset.TTL,
+			ChangeType: "REPLACE", Records: records,
+		})
+	}
+	for start := 0; start < len(patches); start += delegationBatchSize * rrsetsPerDelegation {
+		end := start + delegationBatchSize*rrsetsPerDelegation
+		if end > len(patches) {
+			end = len(patches)
+		}
+		if err := c.patchRRsets(zoneName, patches[start:end]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// SetDomainSuspended makes a subdomain stop (or resume) resolving:
+//
+//   - in the child zone (when one exists) every record except SOA and the apex
+//     NS is disabled, so the zone answers NODATA for everything;
+//   - in the parent zone, legacy records at or below the name are disabled;
+//     the NS/DS delegation is disabled only when there is no child zone
+//     (custom nameservers), so the parent answers NXDOMAIN. With a child zone
+//     the delegation is kept so signed NODATA answers still validate.
+//
+// PowerDNS treats disabled records as nonexistent, so this is reversible and
+// keeps the operator's data intact.
+func (c *Client) SetDomainSuspended(parentZone, childDomain string, suspended bool) error {
+	childName := ensureTrailingDot(strings.ToLower(childDomain))
+	childZoneExists := false
+	child, err := c.GetZone(childDomain)
+	if err == nil {
+		childZoneExists = true
+	} else if !isNotFoundError(err) {
+		return fmt.Errorf("failed to read child zone %s: %w", childDomain, err)
+	}
+
+	parent, err := c.GetZone(parentZone)
+	if err != nil {
+		return fmt.Errorf("failed to read parent zone %s: %w", parentZone, err)
+	}
+	var parentTargets []RRset
+	for _, rrset := range parent.RRsets {
+		name := strings.ToLower(rrset.Name)
+		if name != childName && !strings.HasSuffix(name, "."+childName) {
+			continue
+		}
+		if rrset.Type == "SOA" {
+			continue
+		}
+		if (rrset.Type == "NS" || rrset.Type == "DS") && name == childName && childZoneExists {
+			continue
+		}
+		parentTargets = append(parentTargets, rrset)
+	}
+	if err := c.toggleRRsets(ensureTrailingDot(parentZone), parentTargets, suspended); err != nil {
+		return fmt.Errorf("failed to update parent zone %s: %w", parentZone, err)
+	}
+
+	if childZoneExists {
+		var childTargets []RRset
+		for _, rrset := range child.RRsets {
+			if rrset.Type == "SOA" {
+				continue
+			}
+			if rrset.Type == "NS" && strings.EqualFold(rrset.Name, childName) {
+				continue
+			}
+			childTargets = append(childTargets, rrset)
+		}
+		if err := c.toggleRRsets(childName, childTargets, suspended); err != nil {
+			return fmt.Errorf("failed to update child zone %s: %w", childDomain, err)
+		}
+	}
+	return nil
+}
+
+// RemoveDelegations deletes the NS and DS RRsets of many children from the
+// parent zone in batches and rectifies the parent once.
+func (c *Client) RemoveDelegations(parentZone string, children []string) error {
+	if len(children) == 0 {
+		return nil
+	}
+	zoneName := ensureTrailingDot(parentZone)
+	var rrsets []RRset
+	for _, child := range children {
+		name := ensureTrailingDot(child)
+		rrsets = append(rrsets,
+			RRset{Name: name, Type: "DS", ChangeType: "DELETE"},
+			RRset{Name: name, Type: "NS", ChangeType: "DELETE"},
+		)
+	}
+	step := delegationBatchSize * rrsetsPerDelegation
+	for start := 0; start < len(rrsets); start += step {
+		end := start + step
+		if end > len(rrsets) {
+			end = len(rrsets)
+		}
+		if err := c.patchRRsets(zoneName, rrsets[start:end]); err != nil {
+			return fmt.Errorf("failed to remove delegations from %s: %w", parentZone, err)
+		}
+	}
+	if err := c.RectifyZone(parentZone); err != nil {
+		return fmt.Errorf("failed to rectify parent zone %s: %w", parentZone, err)
+	}
+	return nil
+}
+
 // ensureTrailingDot 确保域名以点结尾
 func ensureTrailingDot(s string) string {
 	if len(s) == 0 {

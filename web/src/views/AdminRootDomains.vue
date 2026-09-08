@@ -480,6 +480,39 @@
           </div>
         </div>
 
+        <div v-if="!dnssecState.loading" class="divider my-2">Orphan zones</div>
+        <div v-if="!dnssecState.loading" class="space-y-2">
+          <p class="text-sm opacity-70">
+            Zones still present in PowerDNS whose domain no longer exists in the database. They keep answering (signed ones even SERVFAIL). Scan first, then delete them together with their NS/DS delegation.
+          </p>
+          <div class="flex items-center gap-3 flex-wrap">
+            <button @click="scanOrphans" class="btn btn-sm btn-outline" :disabled="orphans.scanning">
+              <span v-if="orphans.scanning" class="loading loading-spinner loading-xs"></span>
+              <span v-else>Scan orphan zones</span>
+            </button>
+            <button
+              v-if="orphans.zones.length > 0"
+              @click="cleanupOrphans"
+              class="btn btn-sm btn-error btn-outline"
+              :disabled="orphans.cleaning || dnssecState.orphanCleanup?.running"
+            >
+              <span v-if="orphans.cleaning || dnssecState.orphanCleanup?.running" class="loading loading-spinner loading-xs"></span>
+              <span v-else>Delete {{ orphans.zones.length }} orphan zones</span>
+            </button>
+            <span v-if="orphans.scanned" class="text-xs opacity-70">{{ orphans.zones.length }} orphan zone(s) found</span>
+            <span v-if="dnssecState.orphanCleanup" class="text-xs opacity-70">
+              <template v-if="dnssecState.orphanCleanup.running">Cleaning… {{ dnssecState.orphanCleanup.deleted }}/{{ dnssecState.orphanCleanup.total }}</template>
+              <template v-else>Cleanup done: {{ dnssecState.orphanCleanup.deleted }}/{{ dnssecState.orphanCleanup.total }} deleted, {{ dnssecState.orphanCleanup.errors?.length || 0 }} errors</template>
+            </span>
+          </div>
+          <div v-if="orphans.zones.length > 0" class="bg-base-200 rounded p-2 max-h-32 overflow-auto text-xs font-mono">
+            {{ orphans.zones.slice(0, 200).join(', ') }}<span v-if="orphans.zones.length > 200"> … (+{{ orphans.zones.length - 200 }} more)</span>
+          </div>
+          <div v-if="dnssecState.orphanCleanup && !dnssecState.orphanCleanup.running && dnssecState.orphanCleanup.errors?.length" class="bg-base-200 rounded p-2 max-h-32 overflow-auto">
+            <div v-for="(e, i) in dnssecState.orphanCleanup.errors" :key="i" class="text-xs font-mono text-error break-all">{{ e }}</div>
+          </div>
+        </div>
+
         <div class="modal-action">
           <button type="button" @click="closeDNSSEC" class="btn">Close</button>
         </div>
@@ -530,6 +563,7 @@ const dnssecState = ref({
   submitting: false,
   repairing: false,
   repair: null,
+  orphanCleanup: null,
   zoneExists: false,
   enabled: false,
   keys: [],
@@ -544,11 +578,48 @@ const pollRepair = (domainId) => {
     try {
       const response = await axios.get(`/api/admin/root-domains/${domainId}/dnssec`)
       applyRootDNSSEC(response.data)
-      if (response.data.repair?.running) pollRepair(domainId)
+      if (response.data.repair?.running || response.data.orphan_cleanup?.running) pollRepair(domainId)
     } catch (error) {
       console.error('Failed to poll repair status:', error)
     }
   }, 3000)
+}
+
+const orphans = ref({ scanning: false, cleaning: false, scanned: false, zones: [] })
+
+const scanOrphans = async () => {
+  const domain = dnssecDomain.value
+  if (!domain) return
+  orphans.value.scanning = true
+  try {
+    const response = await axios.get(`/api/admin/root-domains/${domain.id}/orphan-zones`)
+    orphans.value.zones = response.data.zones || []
+    orphans.value.scanned = true
+  } catch (error) {
+    toast.error(error.response?.data?.error || 'Failed to scan orphan zones')
+  } finally {
+    orphans.value.scanning = false
+  }
+}
+
+const cleanupOrphans = async () => {
+  const domain = dnssecDomain.value
+  if (!domain) return
+  if (!confirm(`Delete ${orphans.value.zones.length} orphan zone(s) under .${domain.domain} from PowerDNS?\n\nThese names have no domain in the database. This cannot be undone.`)) return
+  orphans.value.cleaning = true
+  try {
+    const response = await axios.post(`/api/admin/root-domains/${domain.id}/orphan-zones/cleanup`)
+    dnssecState.value.orphanCleanup = response.data.orphan_cleanup
+    toast.success(response.data.message || 'Cleanup started')
+    orphans.value.zones = []
+    orphans.value.scanned = false
+    pollRepair(domain.id)
+  } catch (error) {
+    if (error.response?.data?.orphan_cleanup) dnssecState.value.orphanCleanup = error.response.data.orphan_cleanup
+    toast.error(error.response?.data?.error || 'Failed to start cleanup')
+  } finally {
+    orphans.value.cleaning = false
+  }
 }
 
 const repairDelegations = async () => {
@@ -719,6 +790,7 @@ const applyRootDNSSEC = (data) => {
   dnssecState.value.keys = data.keys || []
   dnssecState.value.dsRecords = data.ds_records || []
   if (data.repair !== undefined) dnssecState.value.repair = data.repair
+  if (data.orphan_cleanup !== undefined) dnssecState.value.orphanCleanup = data.orphan_cleanup
   if (dnssecDomain.value) {
     dnssecStatuses.value[dnssecDomain.value.id] = data
   }
@@ -729,10 +801,12 @@ const openDNSSEC = async (domain) => {
   showDNSSECModal.value = true
   dnssecState.value.loading = true
   dnssecState.value.repair = null
+  dnssecState.value.orphanCleanup = null
+  orphans.value = { scanning: false, cleaning: false, scanned: false, zones: [] }
   try {
     const response = await axios.get(`/api/admin/root-domains/${domain.id}/dnssec`)
     applyRootDNSSEC(response.data)
-    if (response.data.repair?.running) pollRepair(domain.id)
+    if (response.data.repair?.running || response.data.orphan_cleanup?.running) pollRepair(domain.id)
   } catch (error) {
     toast.error(error.response?.data?.error || 'Failed to fetch DNSSEC status')
   } finally {

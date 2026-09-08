@@ -271,7 +271,7 @@ Authorization: Bearer <token>
 | Settings | GET/PUT system settings, system info, dashboard stats, clear Redis cache |
 | Users | List, update, enable/disable, delete |
 | Domains | List all with stats, update status, delete |
-| Root Domains | Full CRUD; DNSSEC status/enable/disable for the root zone (`GET /api/admin/root-domains/:id/dnssec`, `POST .../dnssec/enable`, `POST .../dnssec/disable`) |
+| Root Domains | Full CRUD; DNSSEC status/enable/disable for the root zone (`GET /api/admin/root-domains/:id/dnssec`, `POST .../dnssec/enable`, `POST .../dnssec/disable`); bulk delegation repair (`POST .../dnssec/repair`); orphan zone scan/cleanup (`GET .../orphan-zones`, `POST .../orphan-zones/cleanup`) |
 | Coupons | Full CRUD |
 | Announcements | Full CRUD |
 | Custom Pages | Full CRUD |
@@ -305,6 +305,9 @@ When a domain remains in a failed state beyond the configured grace period, a co
 
 **Q: How do I enable DNSSEC?**
 Open the domain detail page, navigate to the DNSSEC section, and click Enable. The system generates a signing key for your zone and publishes the DS record into the parent (root domain) zone automatically. The DNSSEC panel shows whether the parent zone is signed and whether the DS is in place; the chain of trust is only complete when both are true. Domains that use custom nameservers must configure DNSSEC at their nameserver provider instead.
+
+**Q: What happens to DNS when a domain is suspended?**
+A suspended domain stops resolving: every record in its zone is disabled (the zone answers NODATA), legacy records in the parent zone are disabled, and for custom-nameserver domains the NS delegation in the parent is disabled (NXDOMAIN). Nothing is deleted, so reactivation restores the previous records. Health scans of suspended domains connect directly to the address stored in the domain's records (or answered by its custom nameservers), so a domain that has been fixed is still detected and restored automatically.
 
 **Q: Why does DNSSEC show "chain of trust incomplete"? (administrators)**
 Subdomain DNSSEC only validates when the root domain itself is signed and its DS record is published at the registrar. In Admin → Root Domains, open the DNSSEC dialog for the root domain, enable DNSSEC, and add the displayed DS record(s) at your registrar. Before disabling DNSSEC on a root domain, remove the DS at the registrar first and wait for its TTL to expire.

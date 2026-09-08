@@ -237,6 +237,8 @@ func Setup(db *gorm.DB, rdb *redis.Client, cfg *config.Config) *gin.Engine {
 			admin.POST("/root-domains/:id/dnssec/enable", domainHandler.EnableRootDomainDNSSEC)
 			admin.POST("/root-domains/:id/dnssec/disable", domainHandler.DisableRootDomainDNSSEC)
 			admin.POST("/root-domains/:id/dnssec/repair", domainHandler.RepairRootDomainDelegations)
+			admin.GET("/root-domains/:id/orphan-zones", domainHandler.ListOrphanZones)
+			admin.POST("/root-domains/:id/orphan-zones/cleanup", domainHandler.CleanupOrphanZones)
 
 			// 优惠券管理
 			admin.GET("/coupons", couponHandler.ListCoupons)

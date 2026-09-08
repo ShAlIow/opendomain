@@ -367,3 +367,125 @@ func TestSetDelegationsBatchesAndRectifiesOnce(t *testing.T) {
 		t.Fatalf("unsigned child must get DS DELETE: %+v", first[5])
 	}
 }
+
+func TestSetDomainSuspendedDisablesChildRecordsAndLegacyParentRecordsOnly(t *testing.T) {
+	var patches = map[string][]RRset{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/servers/localhost/zones/child.loc.cc.":
+			_, _ = w.Write([]byte(`{"name":"child.loc.cc.","rrsets":[
+				{"name":"child.loc.cc.","type":"SOA","ttl":3600,"records":[{"content":"soa","disabled":false}]},
+				{"name":"child.loc.cc.","type":"NS","ttl":3600,"records":[{"content":"ns1.example.","disabled":false}]},
+				{"name":"child.loc.cc.","type":"A","ttl":300,"records":[{"content":"1.2.3.4","disabled":false}]},
+				{"name":"www.child.loc.cc.","type":"CNAME","ttl":300,"records":[{"content":"child.loc.cc.","disabled":false}]}
+			]}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/servers/localhost/zones/loc.cc.":
+			_, _ = w.Write([]byte(`{"name":"loc.cc.","rrsets":[
+				{"name":"loc.cc.","type":"SOA","ttl":3600,"records":[{"content":"soa","disabled":false}]},
+				{"name":"child.loc.cc.","type":"NS","ttl":3600,"records":[{"content":"ns1.example.","disabled":false}]},
+				{"name":"child.loc.cc.","type":"DS","ttl":300,"records":[{"content":"1 13 2 AA","disabled":false}]},
+				{"name":"old.child.loc.cc.","type":"A","ttl":300,"records":[{"content":"9.9.9.9","disabled":false}]},
+				{"name":"other.loc.cc.","type":"A","ttl":300,"records":[{"content":"8.8.8.8","disabled":false}]}
+			]}`))
+		case r.Method == http.MethodPatch:
+			var patch struct {
+				RRsets []RRset `json:"rrsets"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&patch); err != nil {
+				t.Fatalf("decode patch: %v", err)
+			}
+			patches[r.URL.Path] = append(patches[r.URL.Path], patch.RRsets...)
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, "test-key")
+	if err := client.SetDomainSuspended("loc.cc", "child.loc.cc", true); err != nil {
+		t.Fatalf("SetDomainSuspended: %v", err)
+	}
+
+	parent := patches["/api/v1/servers/localhost/zones/loc.cc."]
+	if len(parent) != 1 || parent[0].Name != "old.child.loc.cc." || !parent[0].Records[0].Disabled {
+		t.Fatalf("parent: only the legacy record below the delegation should be disabled, got %+v", parent)
+	}
+	child := patches["/api/v1/servers/localhost/zones/child.loc.cc."]
+	if len(child) != 2 {
+		t.Fatalf("child: expected A and CNAME to be disabled, got %+v", child)
+	}
+	for _, rr := range child {
+		if rr.Type == "SOA" || rr.Type == "NS" || !rr.Records[0].Disabled || rr.ChangeType != "REPLACE" {
+			t.Fatalf("child: unexpected rrset %+v", rr)
+		}
+	}
+}
+
+func TestSetDomainSuspendedDisablesDelegationWhenNoChildZone(t *testing.T) {
+	var parentPatch []RRset
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/servers/localhost/zones/ext.loc.cc.":
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"error":"Not Found"}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/servers/localhost/zones/loc.cc.":
+			_, _ = w.Write([]byte(`{"name":"loc.cc.","rrsets":[
+				{"name":"ext.loc.cc.","type":"NS","ttl":3600,"records":[{"content":"ns1.custom.","disabled":false}]},
+				{"name":"ext.loc.cc.","type":"DS","ttl":300,"records":[{"content":"1 13 2 AA","disabled":false}]}
+			]}`))
+		case r.Method == http.MethodPatch:
+			var patch struct {
+				RRsets []RRset `json:"rrsets"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&patch)
+			parentPatch = append(parentPatch, patch.RRsets...)
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, "test-key")
+	if err := client.SetDomainSuspended("loc.cc", "ext.loc.cc", true); err != nil {
+		t.Fatalf("SetDomainSuspended: %v", err)
+	}
+	if len(parentPatch) != 2 || !parentPatch[0].Records[0].Disabled || !parentPatch[1].Records[0].Disabled {
+		t.Fatalf("custom-NS domain: NS and DS delegation must be disabled, got %+v", parentPatch)
+	}
+}
+
+func TestRemoveDelegationsBatchesAndRectifiesOnce(t *testing.T) {
+	var rrsetCount, rectifies int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPatch {
+			var patch struct {
+				RRsets []RRset `json:"rrsets"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&patch)
+			for _, rr := range patch.RRsets {
+				if rr.ChangeType != "DELETE" || (rr.Type != "NS" && rr.Type != "DS") {
+					t.Fatalf("unexpected rrset %+v", rr)
+				}
+			}
+			rrsetCount += len(patch.RRsets)
+		} else if r.Method == http.MethodPut {
+			rectifies++
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, "test-key")
+	children := make([]string, 0, 70)
+	for i := 0; i < 70; i++ {
+		children = append(children, fmt.Sprintf("o%d.loc.cc", i))
+	}
+	if err := client.RemoveDelegations("loc.cc", children); err != nil {
+		t.Fatalf("RemoveDelegations: %v", err)
+	}
+	if rrsetCount != 140 || rectifies != 1 {
+		t.Fatalf("rrsets=%d rectifies=%d", rrsetCount, rectifies)
+	}
+}

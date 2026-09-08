@@ -9,6 +9,7 @@ import (
 	"math"
 	"net/http"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -1823,6 +1824,11 @@ func (h *DomainHandler) GetRootDomainDNSSEC(c *gin.Context) {
 		copyStatus.Errors = append([]string{}, st.Errors...)
 		status["repair"] = copyStatus
 	}
+	if st := orphanCleanupStatus[rootDomain.ID]; st != nil {
+		copyStatus := *st
+		copyStatus.Errors = append([]string{}, st.Errors...)
+		status["orphan_cleanup"] = copyStatus
+	}
 	delegationRepairMu.Unlock()
 	c.JSON(http.StatusOK, status)
 }
@@ -1895,7 +1901,129 @@ type DelegationRepairStatus struct {
 	Delegated  int       `json:"delegated"`
 	WithDS     int       `json:"with_ds"`
 	NoZone     int       `json:"no_zone"`
+	Suspended  int       `json:"suspended"`
 	Errors     []string  `json:"errors"`
+}
+
+// OrphanCleanupStatus 记录一次孤儿 zone 清理的进度/结果
+type OrphanCleanupStatus struct {
+	Running    bool      `json:"running"`
+	StartedAt  time.Time `json:"started_at"`
+	FinishedAt time.Time `json:"finished_at,omitempty"`
+	Total      int       `json:"total"`
+	Deleted    int       `json:"deleted"`
+	Errors     []string  `json:"errors"`
+}
+
+var orphanCleanupStatus = map[uint]*OrphanCleanupStatus{}
+
+// findOrphanZones 返回 PowerDNS 中位于根域名之下、但数据库里已无对应有效域名的 zone。
+func (h *DomainHandler) findOrphanZones(rootDomain *models.RootDomain) ([]string, error) {
+	zones, err := h.pdns.ListZones()
+	if err != nil {
+		return nil, fmt.Errorf("failed to list PowerDNS zones: %w", err)
+	}
+	var live []string
+	if err := h.db.Model(&models.Domain{}).
+		Where("root_domain_id = ? AND status <> ?", rootDomain.ID, "deleted").
+		Pluck("full_domain", &live).Error; err != nil {
+		return nil, fmt.Errorf("failed to load domains: %w", err)
+	}
+	liveSet := make(map[string]bool, len(live))
+	for _, d := range live {
+		liveSet[strings.ToLower(d)] = true
+	}
+	suffix := "." + strings.ToLower(rootDomain.Domain)
+	var orphans []string
+	for _, z := range zones {
+		name := strings.ToLower(strings.TrimSuffix(z.Name, "."))
+		if !strings.HasSuffix(name, suffix) || liveSet[name] {
+			continue
+		}
+		orphans = append(orphans, name)
+	}
+	sort.Strings(orphans)
+	return orphans, nil
+}
+
+// ListOrphanZones 管理员：列出根域名下的孤儿 zone（预览，不做修改）
+func (h *DomainHandler) ListOrphanZones(c *gin.Context) {
+	var rootDomain models.RootDomain
+	if err := h.db.First(&rootDomain, c.Param("id")).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Root domain not found"})
+		return
+	}
+	orphans, err := h.findOrphanZones(&rootDomain)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if orphans == nil {
+		orphans = []string{}
+	}
+	c.JSON(http.StatusOK, gin.H{"root_domain": rootDomain.Domain, "count": len(orphans), "zones": orphans})
+}
+
+// CleanupOrphanZones 管理员：删除孤儿 zone 及其在父区中的 NS/DS 委派（异步）。
+// 孤儿 zone 仍会被 PowerDNS 应答（已签名的还会因缺少 DS 而 SERVFAIL），
+// 但数据库中已没有对应域名，属于历史遗留，应清理为 NXDOMAIN。
+func (h *DomainHandler) CleanupOrphanZones(c *gin.Context) {
+	var rootDomain models.RootDomain
+	if err := h.db.First(&rootDomain, c.Param("id")).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Root domain not found"})
+		return
+	}
+	orphans, err := h.findOrphanZones(&rootDomain)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	delegationRepairMu.Lock()
+	if st := orphanCleanupStatus[rootDomain.ID]; st != nil && st.Running {
+		delegationRepairMu.Unlock()
+		c.JSON(http.StatusConflict, gin.H{"error": "An orphan zone cleanup is already running for this root domain", "orphan_cleanup": st})
+		return
+	}
+	status := &OrphanCleanupStatus{Running: true, StartedAt: time.Now(), Total: len(orphans), Errors: []string{}}
+	orphanCleanupStatus[rootDomain.ID] = status
+	delegationRepairMu.Unlock()
+
+	go func() {
+		addError := func(format string, args ...interface{}) {
+			msg := fmt.Sprintf(format, args...)
+			fmt.Printf("[orphan-cleanup] %s\n", msg)
+			delegationRepairMu.Lock()
+			if len(status.Errors) < 50 {
+				status.Errors = append(status.Errors, msg)
+			}
+			delegationRepairMu.Unlock()
+		}
+		// Parent first: once NS/DS are gone the names fall back to NXDOMAIN
+		// even if a zone deletion below fails.
+		if err := h.pdns.RemoveDelegations(rootDomain.Domain, orphans); err != nil {
+			addError("failed to remove delegations: %v", err)
+		}
+		for _, zone := range orphans {
+			if err := h.pdns.DeleteZone(zone); err != nil && !powerdns.IsNotFound(err) {
+				addError("%s: %v", zone, err)
+				continue
+			}
+			delegationRepairMu.Lock()
+			status.Deleted++
+			delegationRepairMu.Unlock()
+		}
+		delegationRepairMu.Lock()
+		status.Running = false
+		status.FinishedAt = time.Now()
+		delegationRepairMu.Unlock()
+		fmt.Printf("[orphan-cleanup] %s: deleted %d/%d orphan zones\n", rootDomain.Domain, status.Deleted, status.Total)
+	}()
+
+	c.JSON(http.StatusAccepted, gin.H{
+		"message":        fmt.Sprintf("Cleanup of %d orphan zones under %s started", len(orphans), rootDomain.Domain),
+		"orphan_cleanup": status,
+	})
 }
 
 var (
@@ -2038,6 +2166,21 @@ func (h *DomainHandler) runDelegationRepair(rootDomain models.RootDomain, domain
 		}
 	}
 	delegationRepairMu.Unlock()
+
+	// Re-apply suspension: newly published delegations would otherwise make
+	// suspended domains resolvable again.
+	for i := range domains {
+		if domains[i].Status != "suspended" {
+			continue
+		}
+		if err := h.pdns.SetDomainSuspended(rootDomain.Domain, domains[i].FullDomain, true); err != nil {
+			addError("%s: failed to re-apply suspension: %v", domains[i].FullDomain, err)
+			continue
+		}
+		delegationRepairMu.Lock()
+		status.Suspended++
+		delegationRepairMu.Unlock()
+	}
 	fmt.Printf("[delegation-repair] %s: %d delegations published (%d with DS, %d without zone)\n",
 		rootDomain.Domain, status.Delegated, status.WithDS, status.NoZone)
 	finish()
@@ -2137,13 +2280,13 @@ func (h *DomainHandler) AdminUpdateDomainStatus(c *gin.Context) {
 		return
 	}
 
-	// 同步 PowerDNS：暂停时 disable 所有记录，激活时 enable
+	// 同步 PowerDNS：挂起时停止解析（子 zone 记录 + 父区委派/历史记录），激活时恢复
 	if domain.RootDomain != nil {
-		disabled := req.Status == "suspended"
+		suspended := req.Status == "suspended"
 		go func() {
-			if err := h.pdns.SetSubdomainDisabled(domain.RootDomain.Domain, domain.FullDomain, disabled); err != nil {
-				fmt.Printf("Warning: Failed to %s DNS records in PowerDNS for %s: %v\n",
-					map[bool]string{true: "disable", false: "enable"}[disabled], domain.FullDomain, err)
+			if err := h.pdns.SetDomainSuspended(domain.RootDomain.Domain, domain.FullDomain, suspended); err != nil {
+				fmt.Printf("Warning: Failed to %s resolution in PowerDNS for %s: %v\n",
+					map[bool]string{true: "suspend", false: "restore"}[suspended], domain.FullDomain, err)
 			}
 		}()
 	}

@@ -407,8 +407,21 @@ func (s *Scanner) ScanPendingDomain(ctx context.Context, pending *models.Pending
 
 // ScanDomain 扫描单个域名
 func (s *Scanner) ScanDomain(ctx context.Context, domain *models.Domain) error {
-	// DNS 检查
-	dnsStatus := s.checkDNS(domain.FullDomain)
+	// DNS 检查。挂起中的域名公网不可解析，改为根据数据库记录 / 用户自定义 NS
+	// 找到目标 IP，后续 HTTP/SSL 检查直接连该 IP，这样用户修好后仍能自动恢复。
+	dialIP := ""
+	var dnsStatus string
+	if domain.Status == "suspended" {
+		ips, err := s.resolveSuspended(domain)
+		if err != nil {
+			dnsStatus = "failed"
+		} else {
+			dnsStatus = "success"
+			dialIP = ips[0]
+		}
+	} else {
+		dnsStatus = s.checkDNS(domain.FullDomain)
+	}
 	dnsScan := &models.DomainScan{
 		DomainID:  domain.ID,
 		ScanType:  "dns",
@@ -418,13 +431,13 @@ func (s *Scanner) ScanDomain(ctx context.Context, domain *models.Domain) error {
 	s.db.Create(dnsScan)
 
 	// HTTP 检查
-	httpScan := s.checkHTTP(domain.FullDomain)
+	httpScan := s.checkHTTPAt(domain.FullDomain, dialIP)
 	httpScan.DomainID = domain.ID
 	httpScan.ScannedAt = timeutil.Now()
 	s.db.Create(httpScan)
 
 	// SSL 检查
-	sslScan := s.checkSSL(domain.FullDomain)
+	sslScan := s.checkSSLAt(domain.FullDomain, dialIP)
 	sslScan.DomainID = domain.ID
 	sslScan.ScannedAt = timeutil.Now()
 	s.db.Create(sslScan)
@@ -491,6 +504,24 @@ func (s *Scanner) checkDNS(domain string) string {
 
 // checkHTTP 检查 HTTP 状态
 func (s *Scanner) checkHTTP(domain string) *models.DomainScan {
+	return s.checkHTTPAt(domain, "")
+}
+
+// dialerTo returns a DialContext that ignores the requested host and connects
+// to ip instead (keeping the port), so Host/SNI stay the domain name.
+func dialerTo(ip string) func(ctx context.Context, network, addr string) (net.Conn, error) {
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		_, port, err := net.SplitHostPort(addr)
+		if err != nil {
+			return nil, err
+		}
+		d := net.Dialer{Timeout: 10 * time.Second}
+		return d.DialContext(ctx, network, net.JoinHostPort(ip, port))
+	}
+}
+
+// checkHTTPAt 检查 HTTP 状态；dialIP 非空时直接连接该 IP（用于挂起中的域名）
+func (s *Scanner) checkHTTPAt(domain, dialIP string) *models.DomainScan {
 	scan := &models.DomainScan{
 		ScanType: "http",
 	}
@@ -500,6 +531,9 @@ func (s *Scanner) checkHTTP(domain string) *models.DomainScan {
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
+	}
+	if dialIP != "" {
+		client.Transport = &http.Transport{DialContext: dialerTo(dialIP)}
 	}
 
 	start := timeutil.Now()
@@ -522,12 +556,22 @@ func (s *Scanner) checkHTTP(domain string) *models.DomainScan {
 
 // checkSSL 检查 SSL 证书
 func (s *Scanner) checkSSL(domain string) *models.DomainScan {
+	return s.checkSSLAt(domain, "")
+}
+
+// checkSSLAt 检查 SSL 证书；dialIP 非空时直接连接该 IP，SNI 仍使用域名
+func (s *Scanner) checkSSLAt(domain, dialIP string) *models.DomainScan {
 	scan := &models.DomainScan{
 		ScanType: "ssl",
 	}
 
-	conn, err := tls.Dial("tcp", domain+":443", &tls.Config{
+	target := domain + ":443"
+	if dialIP != "" {
+		target = net.JoinHostPort(dialIP, "443")
+	}
+	conn, err := tls.DialWithDialer(&net.Dialer{Timeout: 10 * time.Second}, "tcp", target, &tls.Config{
 		InsecureSkipVerify: true,
+		ServerName:         domain,
 	})
 
 	if err != nil {
@@ -868,6 +912,9 @@ func (s *Scanner) handleAutoActions(domainID uint, safeBrowsingStatus, virusTota
 		if domain.SuspendedAt != nil {
 			daysSinceAbuse := int(now.Sub(*domain.SuspendedAt).Hours() / 24)
 			if daysSinceAbuse >= 30 {
+				if err := s.deleteAbuseRecordsForDomain(&domain); err != nil {
+					fmt.Printf("[ERROR] Failed to clean PowerDNS for deleted abuse domain %s: %v\n", domain.FullDomain, err)
+				}
 				s.db.Delete(&domain)
 				telegram.SendHealthAlert(domain.FullDomain,
 					[]string{"Domain has been in abuse status for 30+ days"},
@@ -991,7 +1038,10 @@ func (s *Scanner) handleAutoActions(domainID uint, safeBrowsingStatus, virusTota
 			daysSinceFailure := int(now.Sub(*domain.FirstFailedAt).Hours() / 24)
 
 			if daysSinceFailure >= 30 {
-				// 删除域名
+				// 删除域名（先清理 PowerDNS，避免留下孤儿 zone/委派）
+				if err := s.deleteAbuseRecordsForDomain(&domain); err != nil {
+					fmt.Printf("[ERROR] Failed to clean PowerDNS for deleted domain %s: %v\n", domain.FullDomain, err)
+				}
 				s.db.Delete(&domain)
 				telegram.SendHealthAlert(domain.FullDomain,
 					[]string{"Domain down for 30+ days"},
@@ -1003,6 +1053,7 @@ func (s *Scanner) handleAutoActions(domainID uint, safeBrowsingStatus, virusTota
 				reasonText := fmt.Sprintf("Domain down for %d days", daysSinceFailure)
 				domain.SuspendReason = &reasonText
 				s.db.Save(&domain)
+				s.setResolutionSuspended(&domain, true)
 
 				issues := []string{}
 				if summary.DNSStatus == "failed" {
@@ -1038,17 +1089,90 @@ func (s *Scanner) handleAutoActions(domainID uint, safeBrowsingStatus, virusTota
 		// 域名恢复正常，清除失败记录
 		if domain.FirstFailedAt != nil {
 			domain.FirstFailedAt = nil
+			restored := false
 			if domain.Status == "suspended" {
 				domain.Status = "active"
 				domain.SuspendedAt = nil
 				domain.SuspendReason = nil
+				restored = true
 			}
 			s.db.Save(&domain)
+			if restored {
+				s.setResolutionSuspended(&domain, false)
+			}
 			telegram.SendHealthAlert(domain.FullDomain,
 				[]string{"Domain is back online"},
 				"Recovery detected")
 		}
 	}
+}
+
+// setResolutionSuspended 在 PowerDNS 中停止/恢复域名解析
+func (s *Scanner) setResolutionSuspended(domain *models.Domain, suspended bool) {
+	if domain.RootDomain == nil {
+		fmt.Printf("[WARNING] Cannot update resolution for %s: root domain not loaded\n", domain.FullDomain)
+		return
+	}
+	if err := s.pdns.SetDomainSuspended(domain.RootDomain.Domain, domain.FullDomain, suspended); err != nil {
+		fmt.Printf("[ERROR] Failed to %s resolution for %s: %v\n",
+			map[bool]string{true: "suspend", false: "restore"}[suspended], domain.FullDomain, err)
+		return
+	}
+	fmt.Printf("[INFO] Resolution %s for %s\n", map[bool]string{true: "suspended", false: "restored"}[suspended], domain.FullDomain)
+}
+
+// resolveSuspended 为挂起中的域名找出它"本应"指向的 IP：
+// 默认 NS 时读取数据库中的 apex/www 记录，自定义 NS 时直接向用户的 NS 查询。
+func (s *Scanner) resolveSuspended(domain *models.Domain) ([]string, error) {
+	if !domain.UseDefaultNameservers {
+		var nameservers []string
+		_ = json.Unmarshal([]byte(domain.Nameservers), &nameservers)
+		for _, ns := range nameservers {
+			ns = strings.TrimSuffix(strings.TrimSpace(ns), ".")
+			if ns == "" {
+				continue
+			}
+			resolver := &net.Resolver{
+				PreferGo: true,
+				Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
+					d := net.Dialer{Timeout: 5 * time.Second}
+					return d.DialContext(ctx, network, net.JoinHostPort(ns, "53"))
+				},
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+			ips, err := resolver.LookupHost(ctx, domain.FullDomain)
+			cancel()
+			if err == nil && len(ips) > 0 {
+				return ips, nil
+			}
+		}
+		return nil, fmt.Errorf("custom nameservers returned no address for %s", domain.FullDomain)
+	}
+
+	types := []string{"A", "AAAA", "CNAME", "ALIAS"}
+	var records []models.DNSRecord
+	s.db.Where("domain_id = ? AND is_active = ? AND name IN ? AND type IN ?",
+		domain.ID, true, []string{"@", ""}, types).Find(&records)
+	if len(records) == 0 {
+		s.db.Where("domain_id = ? AND is_active = ? AND name = ? AND type IN ?",
+			domain.ID, true, "www", types).Find(&records)
+	}
+	var ips []string
+	for _, r := range records {
+		switch r.Type {
+		case "A", "AAAA":
+			ips = append(ips, strings.TrimSpace(r.Content))
+		default:
+			target := strings.TrimSuffix(strings.Trim(strings.TrimSpace(r.Content), "'\"`"), ".")
+			if resolved, err := net.LookupHost(target); err == nil {
+				ips = append(ips, resolved...)
+			}
+		}
+	}
+	if len(ips) == 0 {
+		return nil, fmt.Errorf("no resolvable records stored for %s", domain.FullDomain)
+	}
+	return ips, nil
 }
 
 // StartPeriodicScanning 启动定期扫描 (可选功能)
