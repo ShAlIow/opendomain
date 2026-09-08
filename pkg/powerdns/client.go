@@ -543,6 +543,85 @@ func (c *Client) UnpublishDSFromParentZone(childDomain, parentZone string) error
 	return nil
 }
 
+// ListZones returns every zone known to the server (metadata only, no RRsets).
+func (c *Client) ListZones() ([]Zone, error) {
+	url := fmt.Sprintf("%s/api/v1/servers/%s/zones", c.BaseURL, c.ServerID)
+	respBody, err := c.doRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	var zones []Zone
+	if err := json.Unmarshal(respBody, &zones); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal zones: %w", err)
+	}
+	return zones, nil
+}
+
+// EnableAPIRectify switches a zone to API-RECTIFY so later API edits keep
+// its NSEC ordering valid.
+func (c *Client) EnableAPIRectify(domain string) error {
+	return c.updateZone(domain, map[string]interface{}{"api_rectify": true})
+}
+
+// Delegation describes a child delegation to publish in a parent zone.
+type Delegation struct {
+	Child       string
+	Nameservers []string
+	DS          []string // optional; empty means "no DS" (insecure delegation)
+}
+
+// delegationBatchSize bounds the number of RRsets sent in one PATCH.
+const delegationBatchSize = 100
+
+// SetDelegations publishes many NS (and optional DS) delegations in the parent
+// zone using batched PATCH requests, then rectifies the parent once. It is
+// meant for bulk repair; use SetDelegation/PublishDSToParentZone for single
+// domains.
+func (c *Client) SetDelegations(parentZone string, delegations []Delegation) error {
+	zoneName := ensureTrailingDot(parentZone)
+	var rrsets []RRset
+	for _, d := range delegations {
+		if len(d.Nameservers) == 0 {
+			return fmt.Errorf("cannot delegate %s without nameservers", d.Child)
+		}
+		name := ensureTrailingDot(d.Child)
+		ns := make([]Record, 0, len(d.Nameservers))
+		for _, n := range d.Nameservers {
+			if strings.TrimSpace(n) == "" {
+				return fmt.Errorf("cannot delegate %s to an empty nameserver", d.Child)
+			}
+			ns = append(ns, Record{Content: ensureTrailingDot(n)})
+		}
+		rrsets = append(rrsets, RRset{Name: name, Type: "NS", TTL: 3600, ChangeType: "REPLACE", Records: ns})
+
+		dsRRset := RRset{Name: name, Type: "DS", TTL: dsRecordTTL, ChangeType: "DELETE"}
+		if len(d.DS) > 0 {
+			dsRRset.ChangeType = "REPLACE"
+			for _, ds := range d.DS {
+				dsRRset.Records = append(dsRRset.Records, Record{Content: ds})
+			}
+		}
+		rrsets = append(rrsets, dsRRset)
+	}
+
+	for start := 0; start < len(rrsets); start += delegationBatchSize {
+		end := start + delegationBatchSize
+		if end > len(rrsets) {
+			end = len(rrsets)
+		}
+		if err := c.patchRRsets(zoneName, rrsets[start:end]); err != nil {
+			return fmt.Errorf("failed to publish delegations %d-%d in %s: %w", start, end, parentZone, err)
+		}
+	}
+	if len(rrsets) == 0 {
+		return nil
+	}
+	if err := c.RectifyZone(parentZone); err != nil {
+		return fmt.Errorf("failed to rectify parent zone %s: %w", parentZone, err)
+	}
+	return nil
+}
+
 // ensureTrailingDot 确保域名以点结尾
 func ensureTrailingDot(s string) string {
 	if len(s) == 0 {

@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -1804,7 +1805,15 @@ func (h *DomainHandler) GetRootDomainDNSSEC(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Root domain not found"})
 		return
 	}
-	c.JSON(http.StatusOK, h.rootDomainDNSSECStatus(&rootDomain))
+	status := h.rootDomainDNSSECStatus(&rootDomain)
+	delegationRepairMu.Lock()
+	if st := delegationRepairStatus[rootDomain.ID]; st != nil {
+		copyStatus := *st
+		copyStatus.Errors = append([]string{}, st.Errors...)
+		status["repair"] = copyStatus
+	}
+	delegationRepairMu.Unlock()
+	c.JSON(http.StatusOK, status)
 }
 
 // EnableRootDomainDNSSEC 管理员：为根域名 zone 启用 DNSSEC。
@@ -1864,6 +1873,152 @@ func (h *DomainHandler) DisableRootDomainDNSSEC(c *gin.Context) {
 		"keys":        []interface{}{},
 		"ds_records":  []string{},
 	})
+}
+
+// DelegationRepairStatus 记录一次批量委派修复的进度/结果
+type DelegationRepairStatus struct {
+	Running    bool      `json:"running"`
+	StartedAt  time.Time `json:"started_at"`
+	FinishedAt time.Time `json:"finished_at,omitempty"`
+	Total      int       `json:"total"`
+	Delegated  int       `json:"delegated"`
+	WithDS     int       `json:"with_ds"`
+	NoZone     int       `json:"no_zone"`
+	Errors     []string  `json:"errors"`
+}
+
+var (
+	delegationRepairMu     sync.Mutex
+	delegationRepairStatus = map[uint]*DelegationRepairStatus{}
+)
+
+// RepairRootDomainDelegations 管理员：为根域名下所有子域名重新发布父区委派。
+//
+// 历史子 zone 只是在 PowerDNS 里独立存在，父区中没有 NS/DS 记录。父区签名后，
+// 验证型解析器无法证明这些子域名是"不安全委派"，已签名的子域名会直接 SERVFAIL。
+// 此接口一次性补齐：默认 NS 的子 zone 发布 NS（已签名者附带 DS），
+// 自定义 NS 的域名发布其 NS。任务异步执行，进度通过 GET /dnssec 查询。
+func (h *DomainHandler) RepairRootDomainDelegations(c *gin.Context) {
+	var rootDomain models.RootDomain
+	if err := h.db.First(&rootDomain, c.Param("id")).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Root domain not found"})
+		return
+	}
+	if !rootDomain.UseDefaultNameservers {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Root domain is served by external nameservers"})
+		return
+	}
+
+	var domains []models.Domain
+	if err := h.db.Where("root_domain_id = ?", rootDomain.ID).Find(&domains).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to load domains"})
+		return
+	}
+
+	delegationRepairMu.Lock()
+	if st := delegationRepairStatus[rootDomain.ID]; st != nil && st.Running {
+		delegationRepairMu.Unlock()
+		c.JSON(http.StatusConflict, gin.H{"error": "A delegation repair is already running for this root domain", "repair": st})
+		return
+	}
+	status := &DelegationRepairStatus{Running: true, StartedAt: time.Now(), Total: len(domains), Errors: []string{}}
+	delegationRepairStatus[rootDomain.ID] = status
+	delegationRepairMu.Unlock()
+
+	go h.runDelegationRepair(rootDomain, domains, status)
+
+	c.JSON(http.StatusAccepted, gin.H{
+		"message": fmt.Sprintf("Delegation repair started for %d domains under %s", len(domains), rootDomain.Domain),
+		"repair":  status,
+	})
+}
+
+func (h *DomainHandler) runDelegationRepair(rootDomain models.RootDomain, domains []models.Domain, status *DelegationRepairStatus) {
+	addError := func(format string, args ...interface{}) {
+		msg := fmt.Sprintf(format, args...)
+		fmt.Printf("[delegation-repair] %s\n", msg)
+		delegationRepairMu.Lock()
+		if len(status.Errors) < 50 {
+			status.Errors = append(status.Errors, msg)
+		}
+		delegationRepairMu.Unlock()
+	}
+	finish := func() {
+		delegationRepairMu.Lock()
+		status.Running = false
+		status.FinishedAt = time.Now()
+		delegationRepairMu.Unlock()
+	}
+
+	zones, err := h.pdns.ListZones()
+	if err != nil {
+		addError("failed to list PowerDNS zones: %v", err)
+		finish()
+		return
+	}
+	signed := map[string]bool{}
+	for _, z := range zones {
+		signed[strings.ToLower(strings.TrimSuffix(z.Name, "."))] = z.DNSsec
+	}
+
+	defaultNS := ensureCanonicalNS([]string{h.cfg.DNS.DefaultNS1, h.cfg.DNS.DefaultNS2})
+	var delegations []powerdns.Delegation
+	for _, d := range domains {
+		name := strings.ToLower(d.FullDomain)
+		if !d.UseDefaultNameservers {
+			var ns []string
+			if d.Nameservers != "" {
+				_ = json.Unmarshal([]byte(d.Nameservers), &ns)
+			}
+			if len(ns) == 0 {
+				addError("%s uses custom nameservers but none are stored; skipped", d.FullDomain)
+				continue
+			}
+			delegations = append(delegations, powerdns.Delegation{Child: d.FullDomain, Nameservers: ensureCanonicalNS(ns)})
+			continue
+		}
+
+		isSigned, hasZone := signed[name]
+		if !hasZone {
+			// No child zone (domain never had records). A delegation to a
+			// nonexistent zone would turn NXDOMAIN into REFUSED, so leave it.
+			delegationRepairMu.Lock()
+			status.NoZone++
+			delegationRepairMu.Unlock()
+			continue
+		}
+		del := powerdns.Delegation{Child: d.FullDomain, Nameservers: defaultNS}
+		if isSigned {
+			ds, err := h.pdns.ActiveDSRecords(d.FullDomain)
+			if err != nil {
+				addError("%s: failed to read DS: %v", d.FullDomain, err)
+			} else {
+				del.DS = ds
+			}
+			if err := h.pdns.EnableAPIRectify(d.FullDomain); err != nil {
+				addError("%s: failed to enable api-rectify: %v", d.FullDomain, err)
+			}
+		}
+		delegations = append(delegations, del)
+	}
+
+	if err := h.pdns.SetDelegations(rootDomain.Domain, delegations); err != nil {
+		addError("failed to publish delegations in %s: %v", rootDomain.Domain, err)
+		finish()
+		return
+	}
+
+	delegationRepairMu.Lock()
+	status.Delegated = len(delegations)
+	for _, d := range delegations {
+		if len(d.DS) > 0 {
+			status.WithDS++
+		}
+	}
+	delegationRepairMu.Unlock()
+	fmt.Printf("[delegation-repair] %s: %d delegations published (%d with DS, %d without zone)\n",
+		rootDomain.Domain, status.Delegated, status.WithDS, status.NoZone)
+	finish()
 }
 
 // ListDomainsByRootDomain 管理员：获取某个根域名下的所有域名

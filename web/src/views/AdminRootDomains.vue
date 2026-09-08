@@ -458,6 +458,28 @@
           </div>
         </div>
 
+        <div v-if="!dnssecState.loading" class="divider my-2">Subdomain delegations</div>
+        <div v-if="!dnssecState.loading" class="space-y-2">
+          <p class="text-sm opacity-70">
+            Publishes NS (and DS for signed subdomains) records for every subdomain into this zone. Run once after signing the root zone, or whenever subdomains show "chain of trust incomplete".
+          </p>
+          <div class="flex items-center gap-3">
+            <button @click="repairDelegations" class="btn btn-sm btn-outline" :disabled="dnssecState.repairing || dnssecState.repair?.running">
+              <span v-if="dnssecState.repairing || dnssecState.repair?.running" class="loading loading-spinner loading-xs"></span>
+              <span v-else>Repair subdomain delegations</span>
+            </button>
+            <span v-if="dnssecState.repair" class="text-xs opacity-70">
+              <template v-if="dnssecState.repair.running">Running… {{ dnssecState.repair.total }} domains</template>
+              <template v-else>
+                Done: {{ dnssecState.repair.delegated }} delegated ({{ dnssecState.repair.with_ds }} with DS), {{ dnssecState.repair.no_zone }} without zone, {{ dnssecState.repair.errors?.length || 0 }} errors
+              </template>
+            </span>
+          </div>
+          <div v-if="dnssecState.repair && !dnssecState.repair.running && dnssecState.repair.errors?.length" class="bg-base-200 rounded p-2 max-h-40 overflow-auto">
+            <div v-for="(e, i) in dnssecState.repair.errors" :key="i" class="text-xs font-mono text-error break-all">{{ e }}</div>
+          </div>
+        </div>
+
         <div class="modal-action">
           <button type="button" @click="closeDNSSEC" class="btn">Close</button>
         </div>
@@ -506,11 +528,46 @@ const dnssecDomain = ref(null)
 const dnssecState = ref({
   loading: false,
   submitting: false,
+  repairing: false,
+  repair: null,
   zoneExists: false,
   enabled: false,
   keys: [],
   dsRecords: [],
 })
+let repairPollTimer = null
+
+const pollRepair = (domainId) => {
+  clearTimeout(repairPollTimer)
+  repairPollTimer = setTimeout(async () => {
+    if (!showDNSSECModal.value || dnssecDomain.value?.id !== domainId) return
+    try {
+      const response = await axios.get(`/api/admin/root-domains/${domainId}/dnssec`)
+      applyRootDNSSEC(response.data)
+      if (response.data.repair?.running) pollRepair(domainId)
+    } catch (error) {
+      console.error('Failed to poll repair status:', error)
+    }
+  }, 3000)
+}
+
+const repairDelegations = async () => {
+  const domain = dnssecDomain.value
+  if (!domain) return
+  if (!confirm(`Publish NS/DS delegations for all subdomains of .${domain.domain} into its zone?`)) return
+  dnssecState.value.repairing = true
+  try {
+    const response = await axios.post(`/api/admin/root-domains/${domain.id}/dnssec/repair`)
+    dnssecState.value.repair = response.data.repair
+    toast.success(response.data.message || 'Repair started')
+    pollRepair(domain.id)
+  } catch (error) {
+    if (error.response?.data?.repair) dnssecState.value.repair = error.response.data.repair
+    toast.error(error.response?.data?.error || 'Failed to start repair')
+  } finally {
+    dnssecState.value.repairing = false
+  }
+}
 
 onMounted(async () => {
   await fetchRootDomains()
@@ -661,6 +718,7 @@ const applyRootDNSSEC = (data) => {
   dnssecState.value.enabled = !!data.enabled
   dnssecState.value.keys = data.keys || []
   dnssecState.value.dsRecords = data.ds_records || []
+  if (data.repair !== undefined) dnssecState.value.repair = data.repair
   if (dnssecDomain.value) {
     dnssecStatuses.value[dnssecDomain.value.id] = data
   }
@@ -670,9 +728,11 @@ const openDNSSEC = async (domain) => {
   dnssecDomain.value = domain
   showDNSSECModal.value = true
   dnssecState.value.loading = true
+  dnssecState.value.repair = null
   try {
     const response = await axios.get(`/api/admin/root-domains/${domain.id}/dnssec`)
     applyRootDNSSEC(response.data)
+    if (response.data.repair?.running) pollRepair(domain.id)
   } catch (error) {
     toast.error(error.response?.data?.error || 'Failed to fetch DNSSEC status')
   } finally {
@@ -681,6 +741,7 @@ const openDNSSEC = async (domain) => {
 }
 
 const closeDNSSEC = () => {
+  clearTimeout(repairPollTimer)
   showDNSSECModal.value = false
   dnssecDomain.value = null
 }

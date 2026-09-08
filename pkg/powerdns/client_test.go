@@ -2,6 +2,7 @@ package powerdns
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -299,5 +300,66 @@ func TestDisableDNSSECSendsDnssecFalse(t *testing.T) {
 	client := NewClient(server.URL, "test-key")
 	if err := client.DisableDNSSEC("child.loc.cc"); err != nil {
 		t.Fatalf("DisableDNSSEC: %v", err)
+	}
+}
+
+func TestSetDelegationsBatchesAndRectifiesOnce(t *testing.T) {
+	var patches [][]RRset
+	var rectifies int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPatch:
+			var patch struct {
+				RRsets []RRset `json:"rrsets"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&patch); err != nil {
+				t.Fatalf("decode patch: %v", err)
+			}
+			patches = append(patches, patch.RRsets)
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodPut && r.URL.Path == "/api/v1/servers/localhost/zones/loc.cc./rectify":
+			rectifies++
+			w.WriteHeader(http.StatusOK)
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	// 60 children -> 120 rrsets -> 2 batches of 100 max
+	var dels []Delegation
+	for i := 0; i < 60; i++ {
+		d := Delegation{Child: fmt.Sprintf("c%d.loc.cc", i), Nameservers: []string{"ns1.example", "ns2.example"}}
+		if i%2 == 0 {
+			d.DS = []string{"1 13 2 AA"}
+		}
+		dels = append(dels, d)
+	}
+
+	client := NewClient(server.URL, "test-key")
+	if err := client.SetDelegations("loc.cc", dels); err != nil {
+		t.Fatalf("SetDelegations: %v", err)
+	}
+	if len(patches) != 2 || len(patches[0]) != 100 || len(patches[1]) != 20 {
+		t.Fatalf("unexpected batching: %d patches, sizes %v", len(patches), func() []int {
+			var s []int
+			for _, p := range patches {
+				s = append(s, len(p))
+			}
+			return s
+		}())
+	}
+	if rectifies != 1 {
+		t.Fatalf("expected exactly one rectify, got %d", rectifies)
+	}
+	first := patches[0]
+	if first[0].Type != "NS" || first[0].Name != "c0.loc.cc." || first[0].Records[0].Content != "ns1.example." {
+		t.Fatalf("unexpected NS rrset: %+v", first[0])
+	}
+	if first[1].Type != "DS" || first[1].ChangeType != "REPLACE" || first[1].TTL != dsRecordTTL {
+		t.Fatalf("signed child must get DS REPLACE: %+v", first[1])
+	}
+	if first[3].Type != "DS" || first[3].ChangeType != "DELETE" {
+		t.Fatalf("unsigned child must get DS DELETE: %+v", first[3])
 	}
 }
