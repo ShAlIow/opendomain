@@ -135,7 +135,13 @@ func (c *Client) SetDelegation(parentZone, childDomain string, nameservers []str
 		entries = append(entries, RecordEntry{Content: ensureTrailingDot(ns)})
 	}
 
-	if err := c.SetRecords(parentZone, childDomain, "NS", entries, 3600); err != nil {
+	// A CNAME left behind at the delegation point (legacy records stored in
+	// the parent) conflicts with NS; drop it in the same PATCH, deletes first.
+	rrsets := []RRset{
+		{Name: ensureTrailingDot(childDomain), Type: "CNAME", ChangeType: "DELETE"},
+		{Name: ensureTrailingDot(childDomain), Type: "NS", TTL: 3600, ChangeType: "REPLACE", Records: recordsFromEntries("NS", entries)},
+	}
+	if err := c.patchRRsets(ensureTrailingDot(parentZone), rrsets); err != nil {
 		return fmt.Errorf("failed to publish delegation for %s in %s: %w", childDomain, parentZone, err)
 	}
 	if err := c.RectifyZone(parentZone); err != nil {
@@ -205,6 +211,21 @@ func (c *Client) SetRecords(domain, name, recordType string, entries []RecordEnt
 	zoneName := ensureTrailingDot(domain)
 	recordName := ensureTrailingDot(name)
 
+	records := recordsFromEntries(recordType, entries)
+
+	rrset := RRset{
+		Name:       recordName,
+		Type:       recordType,
+		TTL:        ttl,
+		ChangeType: "REPLACE",
+		Records:    records,
+	}
+
+	return c.patchRRset(zoneName, rrset)
+}
+
+// recordsFromEntries renders RecordEntry values into PowerDNS record content.
+func recordsFromEntries(recordType string, entries []RecordEntry) []Record {
 	records := make([]Record, 0, len(entries))
 	for _, e := range entries {
 		var content string
@@ -217,16 +238,7 @@ func (c *Client) SetRecords(domain, name, recordType string, entries []RecordEnt
 		}
 		records = append(records, Record{Content: content, Disabled: false})
 	}
-
-	rrset := RRset{
-		Name:       recordName,
-		Type:       recordType,
-		TTL:        ttl,
-		ChangeType: "REPLACE",
-		Records:    records,
-	}
-
-	return c.patchRRset(zoneName, rrset)
+	return records
 }
 
 // DeleteRRset 删除某个 name+type 的所有记录
@@ -571,61 +583,74 @@ type Delegation struct {
 	DS          []string // optional; empty means "no DS" (insecure delegation)
 }
 
-// delegationBatchSize bounds the number of RRsets sent in one PATCH.
-const delegationBatchSize = 100
+// delegationBatchSize bounds the number of delegations sent in one PATCH.
+const delegationBatchSize = 40
+
+// rrsetsPerDelegation is the fixed number of RRsets emitted per delegation:
+// CNAME DELETE (clears legacy conflicts), NS REPLACE, DS REPLACE/DELETE.
+const rrsetsPerDelegation = 3
+
+func delegationRRsets(d Delegation) ([]RRset, error) {
+	if len(d.Nameservers) == 0 {
+		return nil, fmt.Errorf("cannot delegate %s without nameservers", d.Child)
+	}
+	name := ensureTrailingDot(d.Child)
+	ns := make([]Record, 0, len(d.Nameservers))
+	for _, n := range d.Nameservers {
+		n = strings.ToLower(strings.TrimSpace(n))
+		if n == "" {
+			return nil, fmt.Errorf("cannot delegate %s to an empty nameserver", d.Child)
+		}
+		ns = append(ns, Record{Content: ensureTrailingDot(n)})
+	}
+	dsRRset := RRset{Name: name, Type: "DS", TTL: dsRecordTTL, ChangeType: "DELETE"}
+	if len(d.DS) > 0 {
+		dsRRset.ChangeType = "REPLACE"
+		for _, ds := range d.DS {
+			dsRRset.Records = append(dsRRset.Records, Record{Content: ds})
+		}
+	}
+	return []RRset{
+		{Name: name, Type: "CNAME", ChangeType: "DELETE"},
+		{Name: name, Type: "NS", TTL: 3600, ChangeType: "REPLACE", Records: ns},
+		dsRRset,
+	}, nil
+}
 
 // SetDelegations publishes many NS (and optional DS) delegations in the parent
 // zone using batched PATCH requests, then rectifies the parent once. It is
 // meant for bulk repair; use SetDelegation/PublishDSToParentZone for single
-// domains.
+// domains. A delegation that PowerDNS rejects is retried on its own and
+// reported through DelegationErrors while the others are still published.
 func (c *Client) SetDelegations(parentZone string, delegations []Delegation) error {
 	zoneName := ensureTrailingDot(parentZone)
 	var rrsets []RRset
 	for _, d := range delegations {
-		if len(d.Nameservers) == 0 {
-			return fmt.Errorf("cannot delegate %s without nameservers", d.Child)
+		rs, err := delegationRRsets(d)
+		if err != nil {
+			return err
 		}
-		name := ensureTrailingDot(d.Child)
-		ns := make([]Record, 0, len(d.Nameservers))
-		for _, n := range d.Nameservers {
-			n = strings.ToLower(strings.TrimSpace(n))
-			if n == "" {
-				return fmt.Errorf("cannot delegate %s to an empty nameserver", d.Child)
-			}
-			ns = append(ns, Record{Content: ensureTrailingDot(n)})
-		}
-		rrsets = append(rrsets, RRset{Name: name, Type: "NS", TTL: 3600, ChangeType: "REPLACE", Records: ns})
-
-		dsRRset := RRset{Name: name, Type: "DS", TTL: dsRecordTTL, ChangeType: "DELETE"}
-		if len(d.DS) > 0 {
-			dsRRset.ChangeType = "REPLACE"
-			for _, ds := range d.DS {
-				dsRRset.Records = append(dsRRset.Records, Record{Content: ds})
-			}
-		}
-		rrsets = append(rrsets, dsRRset)
+		rrsets = append(rrsets, rs...)
+	}
+	if len(rrsets) == 0 {
+		return nil
 	}
 
-	// rrsets come in (NS, DS) pairs per delegation, so batches stay aligned.
+	step := delegationBatchSize * rrsetsPerDelegation
 	var failures []error
-	for start := 0; start < len(rrsets); start += delegationBatchSize {
-		end := start + delegationBatchSize
+	for start := 0; start < len(rrsets); start += step {
+		end := start + step
 		if end > len(rrsets) {
 			end = len(rrsets)
 		}
 		if err := c.patchRRsets(zoneName, rrsets[start:end]); err == nil {
 			continue
 		}
-		// One bad record fails the whole batch; retry each delegation on its
-		// own so a single invalid entry does not block the others.
-		for i := start; i < end; i += 2 {
-			if err := c.patchRRsets(zoneName, rrsets[i:i+2]); err != nil {
+		for i := start; i < end; i += rrsetsPerDelegation {
+			if err := c.patchRRsets(zoneName, rrsets[i:i+rrsetsPerDelegation]); err != nil {
 				failures = append(failures, fmt.Errorf("%s: %w", strings.TrimSuffix(rrsets[i].Name, "."), err))
 			}
 		}
-	}
-	if len(rrsets) == 0 {
-		return nil
 	}
 	if err := c.RectifyZone(parentZone); err != nil {
 		return fmt.Errorf("failed to rectify parent zone %s: %w", parentZone, err)

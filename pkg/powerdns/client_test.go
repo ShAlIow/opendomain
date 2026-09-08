@@ -58,10 +58,11 @@ func TestEnsureDelegatedZoneCreatesChildBeforeParentDelegation(t *testing.T) {
 			if err := json.NewDecoder(r.Body).Decode(&patch); err != nil {
 				t.Fatalf("decode delegation: %v", err)
 			}
-			if len(patch.RRsets) != 1 || patch.RRsets[0].Type != "NS" || patch.RRsets[0].Name != "child.loc.cc." {
+			if len(patch.RRsets) != 2 || patch.RRsets[0].Type != "CNAME" || patch.RRsets[0].ChangeType != "DELETE" ||
+				patch.RRsets[1].Type != "NS" || patch.RRsets[1].Name != "child.loc.cc." {
 				t.Fatalf("unexpected delegation: %+v", patch.RRsets)
 			}
-			got := []string{patch.RRsets[0].Records[0].Content, patch.RRsets[0].Records[1].Content}
+			got := []string{patch.RRsets[1].Records[0].Content, patch.RRsets[1].Records[1].Content}
 			want := []string{"ns1.example.", "ns2.example."}
 			if !reflect.DeepEqual(got, want) {
 				t.Fatalf("delegation nameservers = %v, want %v", got, want)
@@ -326,7 +327,7 @@ func TestSetDelegationsBatchesAndRectifiesOnce(t *testing.T) {
 	}))
 	defer server.Close()
 
-	// 60 children -> 120 rrsets -> 2 batches of 100 max
+	// 60 delegations x 3 rrsets = 180; batches of 40 delegations -> 120 + 60
 	var dels []Delegation
 	for i := 0; i < 60; i++ {
 		d := Delegation{Child: fmt.Sprintf("c%d.loc.cc", i), Nameservers: []string{"ns1.example", "ns2.example"}}
@@ -340,7 +341,7 @@ func TestSetDelegationsBatchesAndRectifiesOnce(t *testing.T) {
 	if err := client.SetDelegations("loc.cc", dels); err != nil {
 		t.Fatalf("SetDelegations: %v", err)
 	}
-	if len(patches) != 2 || len(patches[0]) != 100 || len(patches[1]) != 20 {
+	if len(patches) != 2 || len(patches[0]) != 120 || len(patches[1]) != 60 {
 		t.Fatalf("unexpected batching: %d patches, sizes %v", len(patches), func() []int {
 			var s []int
 			for _, p := range patches {
@@ -353,13 +354,16 @@ func TestSetDelegationsBatchesAndRectifiesOnce(t *testing.T) {
 		t.Fatalf("expected exactly one rectify, got %d", rectifies)
 	}
 	first := patches[0]
-	if first[0].Type != "NS" || first[0].Name != "c0.loc.cc." || first[0].Records[0].Content != "ns1.example." {
-		t.Fatalf("unexpected NS rrset: %+v", first[0])
+	if first[0].Type != "CNAME" || first[0].ChangeType != "DELETE" || first[0].Name != "c0.loc.cc." {
+		t.Fatalf("legacy CNAME at the delegation point must be deleted first: %+v", first[0])
 	}
-	if first[1].Type != "DS" || first[1].ChangeType != "REPLACE" || first[1].TTL != dsRecordTTL {
-		t.Fatalf("signed child must get DS REPLACE: %+v", first[1])
+	if first[1].Type != "NS" || first[1].Name != "c0.loc.cc." || first[1].Records[0].Content != "ns1.example." {
+		t.Fatalf("unexpected NS rrset: %+v", first[1])
 	}
-	if first[3].Type != "DS" || first[3].ChangeType != "DELETE" {
-		t.Fatalf("unsigned child must get DS DELETE: %+v", first[3])
+	if first[2].Type != "DS" || first[2].ChangeType != "REPLACE" || first[2].TTL != dsRecordTTL {
+		t.Fatalf("signed child must get DS REPLACE: %+v", first[2])
+	}
+	if first[5].Type != "DS" || first[5].ChangeType != "DELETE" {
+		t.Fatalf("unsigned child must get DS DELETE: %+v", first[5])
 	}
 }
