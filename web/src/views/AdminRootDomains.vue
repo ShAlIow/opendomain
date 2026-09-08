@@ -122,6 +122,23 @@
             </div>
 
             <div class="flex justify-between items-center">
+              <span class="text-sm font-medium opacity-70">DNSSEC:</span>
+              <button
+                v-if="domain.use_default_nameservers !== false"
+                @click="openDNSSEC(domain)"
+                class="px-3 py-1 rounded-full text-xs font-medium inline-flex items-center gap-1.5 transition-colors cursor-pointer"
+                :class="dnssecBadgeClass(domain.id)"
+                title="Manage DNSSEC"
+              >
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
+                </svg>
+                {{ dnssecBadgeText(domain.id) }}
+              </button>
+              <span v-else class="text-xs opacity-60">External NS</span>
+            </div>
+
+            <div class="flex justify-between items-center">
               <span class="text-sm font-medium opacity-70">Pricing:</span>
               <span v-if="domain.is_free" class="px-3 py-1 rounded-full text-xs font-medium inline-flex items-center gap-1.5 bg-success/10 text-success">
                 <svg xmlns="http://www.w3.org/2000/svg" class="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -381,6 +398,74 @@
         <button type="button" @click="closeModals">close</button>
       </form>
     </dialog>
+
+    <!-- DNSSEC Modal -->
+    <dialog :class="{ 'modal': true, 'modal-open': showDNSSECModal }">
+      <div class="modal-box w-11/12 max-w-2xl">
+        <h3 class="font-bold text-2xl mb-1 font-mono">DNSSEC · .{{ dnssecDomain?.domain }}</h3>
+        <p class="text-sm opacity-70 mb-4">
+          The root zone must be signed and its DS record published at the registrar before any subdomain DNSSEC can validate.
+        </p>
+
+        <div v-if="dnssecState.loading" class="flex justify-center py-8">
+          <span class="loading loading-spinner loading-lg"></span>
+        </div>
+
+        <div v-else class="space-y-4">
+          <div class="flex items-center justify-between">
+            <span class="badge" :class="dnssecState.enabled ? 'badge-success' : 'badge-ghost'">
+              {{ dnssecState.enabled ? 'Signed' : 'Not signed' }}
+            </span>
+            <button
+              @click="toggleRootDNSSEC"
+              class="btn btn-sm"
+              :class="dnssecState.enabled ? 'btn-error' : 'btn-success'"
+              :disabled="dnssecState.submitting"
+            >
+              <span v-if="dnssecState.submitting" class="loading loading-spinner loading-xs"></span>
+              <span v-else>{{ dnssecState.enabled ? 'Disable DNSSEC' : 'Enable DNSSEC' }}</span>
+            </button>
+          </div>
+
+          <div v-if="!dnssecState.zoneExists" class="alert alert-warning text-sm">
+            <span>Zone does not exist in PowerDNS yet. Enabling DNSSEC will create it with the configured nameservers.</span>
+          </div>
+
+          <div v-if="dnssecState.enabled" class="space-y-3">
+            <div class="alert alert-info text-sm">
+              <span>Add the DS record(s) below at your registrar for <strong>.{{ dnssecDomain?.domain }}</strong>. Remove them there before disabling DNSSEC.</span>
+            </div>
+            <div v-if="dnssecState.dsRecords.length === 0" class="text-sm opacity-60">No active DS records found.</div>
+            <div v-for="(ds, idx) in dnssecState.dsRecords" :key="idx" class="flex items-center gap-2">
+              <code class="bg-base-300 px-3 py-2 rounded text-xs font-mono break-all flex-1">{{ ds }}</code>
+              <button @click="copyText(ds)" class="btn btn-ghost btn-xs btn-square flex-shrink-0" title="Copy">
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
+                </svg>
+              </button>
+            </div>
+            <div v-for="key in dnssecState.keys" :key="key.id">
+              <div class="text-xs font-semibold uppercase tracking-wide opacity-50 mb-1">DNSKEY ({{ key.keytype.toUpperCase() }}, {{ key.algorithm }})</div>
+              <div class="flex items-center gap-2">
+                <code class="bg-base-300 px-3 py-2 rounded text-xs font-mono break-all flex-1">{{ key.dnskey }}</code>
+                <button @click="copyText(key.dnskey)" class="btn btn-ghost btn-xs btn-square flex-shrink-0" title="Copy">
+                  <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
+                  </svg>
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="modal-action">
+          <button type="button" @click="closeDNSSEC" class="btn">Close</button>
+        </div>
+      </div>
+      <form method="dialog" class="modal-backdrop">
+        <button type="button" @click="closeDNSSEC">close</button>
+      </form>
+    </dialog>
   </div>
 </template>
 
@@ -414,6 +499,19 @@ const formData = ref({
   nameservers: [''],
 })
 
+// DNSSEC state per root domain (id -> status) plus the modal state
+const dnssecStatuses = ref({})
+const showDNSSECModal = ref(false)
+const dnssecDomain = ref(null)
+const dnssecState = ref({
+  loading: false,
+  submitting: false,
+  zoneExists: false,
+  enabled: false,
+  keys: [],
+  dsRecords: [],
+})
+
 onMounted(async () => {
   await fetchRootDomains()
 })
@@ -423,6 +521,7 @@ const fetchRootDomains = async () => {
   try {
     const response = await axios.get('/api/admin/root-domains')
     rootDomains.value = response.data.root_domains || []
+    fetchDNSSECStatuses()
   } catch (error) {
     console.error('Failed to fetch root domains:', error)
     toast.error(error.response?.data?.error || 'Failed to fetch root domains')
@@ -527,6 +626,92 @@ const deleteDomain = async (domain) => {
     await fetchRootDomains()
   } catch (error) {
     toast.error(error.response?.data?.error || 'Failed to delete root domain')
+  }
+}
+
+const fetchDNSSECStatuses = async () => {
+  await Promise.all(
+    rootDomains.value
+      .filter(d => d.use_default_nameservers !== false)
+      .map(async (d) => {
+        try {
+          const response = await axios.get(`/api/admin/root-domains/${d.id}/dnssec`)
+          dnssecStatuses.value[d.id] = response.data
+        } catch (error) {
+          console.error(`Failed to fetch DNSSEC status for ${d.domain}:`, error)
+        }
+      })
+  )
+}
+
+const dnssecBadgeClass = (id) => {
+  const status = dnssecStatuses.value[id]
+  if (!status) return 'bg-base-300 text-base-content'
+  return status.enabled ? 'bg-success/10 text-success hover:bg-success/20' : 'bg-warning/10 text-warning hover:bg-warning/20'
+}
+
+const dnssecBadgeText = (id) => {
+  const status = dnssecStatuses.value[id]
+  if (!status) return 'Unknown'
+  return status.enabled ? 'Signed' : 'Not signed'
+}
+
+const applyRootDNSSEC = (data) => {
+  dnssecState.value.zoneExists = !!data.zone_exists
+  dnssecState.value.enabled = !!data.enabled
+  dnssecState.value.keys = data.keys || []
+  dnssecState.value.dsRecords = data.ds_records || []
+  if (dnssecDomain.value) {
+    dnssecStatuses.value[dnssecDomain.value.id] = data
+  }
+}
+
+const openDNSSEC = async (domain) => {
+  dnssecDomain.value = domain
+  showDNSSECModal.value = true
+  dnssecState.value.loading = true
+  try {
+    const response = await axios.get(`/api/admin/root-domains/${domain.id}/dnssec`)
+    applyRootDNSSEC(response.data)
+  } catch (error) {
+    toast.error(error.response?.data?.error || 'Failed to fetch DNSSEC status')
+  } finally {
+    dnssecState.value.loading = false
+  }
+}
+
+const closeDNSSEC = () => {
+  showDNSSECModal.value = false
+  dnssecDomain.value = null
+}
+
+const toggleRootDNSSEC = async () => {
+  const domain = dnssecDomain.value
+  if (!domain) return
+  if (dnssecState.value.enabled) {
+    if (!confirm(`Disable DNSSEC for .${domain.domain}?\n\nRemove the DS record at the registrar FIRST and wait for its TTL to expire. Otherwise .${domain.domain} and every subdomain under it will fail validation.`)) {
+      return
+    }
+  }
+  dnssecState.value.submitting = true
+  try {
+    const action = dnssecState.value.enabled ? 'disable' : 'enable'
+    const response = await axios.post(`/api/admin/root-domains/${domain.id}/dnssec/${action}`)
+    applyRootDNSSEC(response.data)
+    toast.success(response.data.message || `DNSSEC ${action}d`)
+  } catch (error) {
+    toast.error(error.response?.data?.error || 'DNSSEC operation failed')
+  } finally {
+    dnssecState.value.submitting = false
+  }
+}
+
+const copyText = async (text) => {
+  try {
+    await navigator.clipboard.writeText(text)
+    toast.success('Copied!')
+  } catch {
+    toast.error('Failed to copy')
   }
 }
 

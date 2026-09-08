@@ -233,6 +233,9 @@ func Setup(db *gorm.DB, rdb *redis.Client, cfg *config.Config) *gin.Engine {
 			admin.PUT("/root-domains/:id", domainHandler.UpdateRootDomain)
 			admin.DELETE("/root-domains/:id", domainHandler.DeleteRootDomain)
 			admin.GET("/root-domains/:id/domains", domainHandler.ListDomainsByRootDomain)
+			admin.GET("/root-domains/:id/dnssec", domainHandler.GetRootDomainDNSSEC)
+			admin.POST("/root-domains/:id/dnssec/enable", domainHandler.EnableRootDomainDNSSEC)
+			admin.POST("/root-domains/:id/dnssec/disable", domainHandler.DisableRootDomainDNSSEC)
 
 			// 优惠券管理
 			admin.GET("/coupons", couponHandler.ListCoupons)

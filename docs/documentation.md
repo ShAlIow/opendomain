@@ -271,7 +271,7 @@ Authorization: Bearer <token>
 | Settings | GET/PUT system settings, system info, dashboard stats, clear Redis cache |
 | Users | List, update, enable/disable, delete |
 | Domains | List all with stats, update status, delete |
-| Root Domains | Full CRUD |
+| Root Domains | Full CRUD; DNSSEC status/enable/disable for the root zone (`GET /api/admin/root-domains/:id/dnssec`, `POST .../dnssec/enable`, `POST .../dnssec/disable`) |
 | Coupons | Full CRUD |
 | Announcements | Full CRUD |
 | Custom Pages | Full CRUD |
@@ -304,7 +304,10 @@ Click the `suspended` badge on the domain card to view the reason. Contact the a
 When a domain remains in a failed state beyond the configured grace period, a countdown appears on the domain card. Renew the domain or fix the underlying issue before the timer expires.
 
 **Q: How do I enable DNSSEC?**
-Open the domain detail page, navigate to the DNSSEC section, and click Enable. The system will automatically generate keys and publish the DS records to PowerDNS.
+Open the domain detail page, navigate to the DNSSEC section, and click Enable. The system generates a signing key for your zone and publishes the DS record into the parent (root domain) zone automatically. The DNSSEC panel shows whether the parent zone is signed and whether the DS is in place; the chain of trust is only complete when both are true. Domains that use custom nameservers must configure DNSSEC at their nameserver provider instead.
+
+**Q: Why does DNSSEC show "chain of trust incomplete"? (administrators)**
+Subdomain DNSSEC only validates when the root domain itself is signed and its DS record is published at the registrar. In Admin → Root Domains, open the DNSSEC dialog for the root domain, enable DNSSEC, and add the displayed DS record(s) at your registrar. Before disabling DNSSEC on a root domain, remove the DS at the registrar first and wait for its TTL to expire.
 
 **Q: What is an ALIAS record?**
 An ALIAS record is a special variant of CNAME that can be used at the zone apex (root domain). PowerDNS resolves the target and returns the resulting IP to the client.

@@ -36,6 +36,7 @@ type Zone struct {
 	Name        string   `json:"name"`
 	Kind        string   `json:"kind"` // Master, Slave, Native
 	DNSsec      bool     `json:"dnssec,omitempty"`
+	APIRectify  bool     `json:"api_rectify,omitempty"`
 	Serial      uint32   `json:"serial,omitempty"`
 	Nameservers []string `json:"nameservers,omitempty"`
 	RRsets      []RRset  `json:"rrsets,omitempty"`
@@ -70,6 +71,7 @@ func (c *Client) CreateZone(domain string, nameservers []string) error {
 		Name:        ensureTrailingDot(domain),
 		Kind:        "Master",
 		Nameservers: nameservers,
+		APIRectify:  true,
 	}
 
 	url := fmt.Sprintf("%s/api/v1/servers/%s/zones", c.BaseURL, c.ServerID)
@@ -80,6 +82,89 @@ func (c *Client) CreateZone(domain string, nameservers []string) error {
 
 	_, err = c.doRequest("POST", url, body)
 	return err
+}
+
+// GetZoneInfo returns zone metadata (kind, dnssec, serial...) without its RRsets.
+func (c *Client) GetZoneInfo(domain string) (*Zone, error) {
+	zoneName := ensureTrailingDot(domain)
+	url := fmt.Sprintf("%s/api/v1/servers/%s/zones/%s?rrsets=false", c.BaseURL, c.ServerID, zoneName)
+
+	respBody, err := c.doRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	var zone Zone
+	if err := json.Unmarshal(respBody, &zone); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal zone: %w", err)
+	}
+	return &zone, nil
+}
+
+// EnsureZone creates a zone when it does not already exist.
+func (c *Client) EnsureZone(domain string, nameservers []string) error {
+	if _, err := c.GetZoneInfo(domain); err == nil {
+		return nil
+	} else if !isNotFoundError(err) {
+		return fmt.Errorf("failed to check zone %s: %w", domain, err)
+	}
+
+	if err := c.CreateZone(domain, nameservers); err != nil {
+		// Another request may have created the zone after GetZone returned 404.
+		if isConflictError(err) {
+			return nil
+		}
+		return fmt.Errorf("failed to create zone %s: %w", domain, err)
+	}
+	return nil
+}
+
+// SetDelegation publishes the child zone's NS RRset in its parent zone.
+// Creating a child zone in PowerDNS does not create this delegation automatically.
+func (c *Client) SetDelegation(parentZone, childDomain string, nameservers []string) error {
+	if len(nameservers) == 0 {
+		return fmt.Errorf("cannot delegate %s without nameservers", childDomain)
+	}
+
+	entries := make([]RecordEntry, 0, len(nameservers))
+	for _, ns := range nameservers {
+		if strings.TrimSpace(ns) == "" {
+			return fmt.Errorf("cannot delegate %s to an empty nameserver", childDomain)
+		}
+		entries = append(entries, RecordEntry{Content: ensureTrailingDot(ns)})
+	}
+
+	if err := c.SetRecords(parentZone, childDomain, "NS", entries, 3600); err != nil {
+		return fmt.Errorf("failed to publish delegation for %s in %s: %w", childDomain, parentZone, err)
+	}
+	if err := c.RectifyZone(parentZone); err != nil {
+		return fmt.Errorf("failed to rectify parent zone %s: %w", parentZone, err)
+	}
+	return nil
+}
+
+// EnsureDelegatedZone makes the child authoritative before publishing its
+// delegation. This ordering avoids exposing a lame delegation during creation.
+func (c *Client) EnsureDelegatedZone(childDomain, parentZone string, nameservers []string) error {
+	if err := c.EnsureZone(childDomain, nameservers); err != nil {
+		return err
+	}
+	return c.SetDelegation(parentZone, childDomain, nameservers)
+}
+
+// RemoveDelegation removes both the DS chain and the NS delegation from the
+// signed parent zone, then rectifies its denial-of-existence chain.
+func (c *Client) RemoveDelegation(parentZone, childDomain string) error {
+	if err := c.DeleteRRset(parentZone, childDomain, "DS"); err != nil {
+		return fmt.Errorf("failed to remove DS for %s from %s: %w", childDomain, parentZone, err)
+	}
+	if err := c.DeleteRRset(parentZone, childDomain, "NS"); err != nil {
+		return fmt.Errorf("failed to remove NS delegation for %s from %s: %w", childDomain, parentZone, err)
+	}
+	if err := c.RectifyZone(parentZone); err != nil {
+		return fmt.Errorf("failed to rectify parent zone %s: %w", parentZone, err)
+	}
+	return nil
 }
 
 // DeleteZone 删除 DNS Zone
@@ -283,16 +368,27 @@ type CryptoKey struct {
 	Bits      int      `json:"bits"`
 }
 
+// dsRecordTTL is the TTL of DS records published at the parent delegation point.
+// Kept short so that disabling DNSSEC (which removes the DS and then the keys)
+// leaves resolvers with a stale DS for as little time as possible.
+const dsRecordTTL = 300
+
 // EnableDNSSEC enables DNSSEC for a zone by creating a CSK if none exist, then rectifies.
 // The zone must already exist. Creating an active key implicitly enables DNSSEC in PowerDNS.
+//
+// The zone is also switched to API-RECTIFY so that every later record change
+// keeps the NSEC ordering valid. Without that, zones created before rectify was
+// enabled serve BOGUS denial-of-existence answers after their first edit.
 func (c *Client) EnableDNSSEC(domain string) error {
 	zoneName := ensureTrailingDot(domain)
 
-	// Check if any active keys already exist
+	if err := c.updateZone(domain, map[string]interface{}{"api_rectify": true}); err != nil {
+		return fmt.Errorf("failed to enable api-rectify on zone %s: %w", domain, err)
+	}
+
 	keys, err := c.GetCryptoKeys(domain)
 	if err != nil {
-		// GetCryptoKeys failed - zone might exist but API issue
-		keys = []CryptoKey{}
+		return fmt.Errorf("failed to list DNSSEC keys for %s: %w", domain, err)
 	}
 
 	hasActiveKey := false
@@ -317,20 +413,73 @@ func (c *Client) EnableDNSSEC(domain string) error {
 	}
 
 	// Rectify the zone to compute NSEC/NSEC3 records
-	_ = c.RectifyZone(domain)
+	if err := c.RectifyZone(domain); err != nil {
+		return fmt.Errorf("failed to rectify zone %s: %w", domain, err)
+	}
 	return nil
 }
 
-// DisableDNSSEC disables DNSSEC for a zone
+// DisableDNSSEC disables DNSSEC for a zone. PowerDNS removes all keys and
+// NSEC3 parameters when dnssec is set to false.
 func (c *Client) DisableDNSSEC(domain string) error {
+	return c.updateZone(domain, map[string]interface{}{"dnssec": false})
+}
+
+// updateZone sends a partial zone metadata update (PUT /zones/{id}).
+func (c *Client) updateZone(domain string, fields map[string]interface{}) error {
 	zoneName := ensureTrailingDot(domain)
 	url := fmt.Sprintf("%s/api/v1/servers/%s/zones/%s", c.BaseURL, c.ServerID, zoneName)
-	body, err := json.Marshal(map[string]interface{}{"dnssec": false})
+	body, err := json.Marshal(fields)
 	if err != nil {
 		return fmt.Errorf("failed to marshal request: %w", err)
 	}
 	_, err = c.doRequest("PUT", url, body)
 	return err
+}
+
+// ActiveDSRecords returns the DS records of every active, published key of a zone.
+func (c *Client) ActiveDSRecords(domain string) ([]string, error) {
+	keys, err := c.GetCryptoKeys(domain)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get crypto keys for %s: %w", domain, err)
+	}
+	var ds []string
+	for _, k := range keys {
+		if k.Active && k.Published {
+			ds = append(ds, k.DS...)
+		}
+	}
+	return ds, nil
+}
+
+// GetRRset returns the records of a single name+type in a zone, or nil when
+// the RRset does not exist. It uses the rrset_name filter so that large
+// parent zones are not transferred in full.
+func (c *Client) GetRRset(domain, name, recordType string) ([]Record, error) {
+	zoneName := ensureTrailingDot(domain)
+	recordName := ensureTrailingDot(name)
+	url := fmt.Sprintf("%s/api/v1/servers/%s/zones/%s?rrset_name=%s", c.BaseURL, c.ServerID, zoneName, recordName)
+
+	respBody, err := c.doRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	var zone Zone
+	if err := json.Unmarshal(respBody, &zone); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal zone: %w", err)
+	}
+	for _, rrset := range zone.RRsets {
+		if strings.EqualFold(rrset.Name, recordName) && rrset.Type == recordType {
+			return rrset.Records, nil
+		}
+	}
+	return nil, nil
+}
+
+// IsNotFound reports whether err comes from a PowerDNS 404 / missing object.
+func IsNotFound(err error) bool {
+	return isNotFoundError(err)
 }
 
 // GetCryptoKeys returns all DNSSEC crypto keys for a zone
@@ -357,18 +506,12 @@ func (c *Client) RectifyZone(domain string) error {
 }
 
 // PublishDSToParentZone reads the DS records from the child zone's crypto keys
-// and writes them as a DS RRset into the parent zone at the delegation point.
+// and writes them as a DS RRset into the parent zone at the delegation point,
+// then rectifies the parent so its NSEC chain covers the new delegation data.
 func (c *Client) PublishDSToParentZone(childDomain, parentZone string) error {
-	keys, err := c.GetCryptoKeys(childDomain)
+	dsContents, err := c.ActiveDSRecords(childDomain)
 	if err != nil {
-		return fmt.Errorf("failed to get crypto keys for %s: %w", childDomain, err)
-	}
-
-	var dsContents []string
-	for _, k := range keys {
-		if k.Active && k.Published {
-			dsContents = append(dsContents, k.DS...)
-		}
+		return err
 	}
 	if len(dsContents) == 0 {
 		return fmt.Errorf("no active DS records found for %s", childDomain)
@@ -379,12 +522,25 @@ func (c *Client) PublishDSToParentZone(childDomain, parentZone string) error {
 		entries[i] = RecordEntry{Content: ds}
 	}
 
-	return c.SetRecords(parentZone, childDomain, "DS", entries, 3600)
+	if err := c.SetRecords(parentZone, childDomain, "DS", entries, dsRecordTTL); err != nil {
+		return fmt.Errorf("failed to publish DS for %s in %s: %w", childDomain, parentZone, err)
+	}
+	if err := c.RectifyZone(parentZone); err != nil {
+		return fmt.Errorf("failed to rectify parent zone %s: %w", parentZone, err)
+	}
+	return nil
 }
 
-// UnpublishDSFromParentZone removes the DS RRset of the child zone from the parent zone.
+// UnpublishDSFromParentZone removes the DS RRset of the child zone from the
+// parent zone and rectifies the parent.
 func (c *Client) UnpublishDSFromParentZone(childDomain, parentZone string) error {
-	return c.DeleteRRset(parentZone, childDomain, "DS")
+	if err := c.DeleteRRset(parentZone, childDomain, "DS"); err != nil {
+		return fmt.Errorf("failed to remove DS for %s from %s: %w", childDomain, parentZone, err)
+	}
+	if err := c.RectifyZone(parentZone); err != nil {
+		return fmt.Errorf("failed to rectify parent zone %s: %w", parentZone, err)
+	}
+	return nil
 }
 
 // ensureTrailingDot 确保域名以点结尾
@@ -396,4 +552,25 @@ func ensureTrailingDot(s string) string {
 		return s + "."
 	}
 	return s
+}
+
+func isNotFoundError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "status 404") ||
+		strings.Contains(message, "not found") ||
+		strings.Contains(message, "could not find")
+}
+
+func isConflictError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "status 409") ||
+		strings.Contains(message, "status 422") ||
+		strings.Contains(message, "conflict") ||
+		strings.Contains(message, "already exists")
 }

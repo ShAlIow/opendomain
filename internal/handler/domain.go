@@ -621,6 +621,102 @@ func (h *DomainHandler) GetDomain(c *gin.Context) {
 	c.JSON(http.StatusOK, domain.ToResponse())
 }
 
+// dnssecKeyView 将 PowerDNS 密钥转换为前端展示格式（仅 active+published）
+func dnssecKeyView(keys []powerdns.CryptoKey) []interface{} {
+	out := []interface{}{}
+	for _, k := range keys {
+		if k.Active && k.Published {
+			out = append(out, gin.H{
+				"id":        k.ID,
+				"keytype":   k.KeyType,
+				"algorithm": k.Algorithm,
+				"bits":      k.Bits,
+				"dnskey":    k.DNSKey,
+				"ds":        k.DS,
+			})
+		}
+	}
+	return out
+}
+
+// domainDNSSECStatus 汇总子域名的 DNSSEC 信任链状态：
+// 子 zone 是否签名、父 zone 是否签名、父 zone 中是否发布了与当前密钥一致的 DS。
+func (h *DomainHandler) domainDNSSECStatus(domain *models.Domain) gin.H {
+	status := gin.H{
+		"enabled":       false,
+		"keys":          []interface{}{},
+		"parent_zone":   "",
+		"parent_signed": false,
+		"ds_published":  false,
+		"chain_valid":   false,
+	}
+	if domain.RootDomain != nil {
+		status["parent_zone"] = domain.RootDomain.Domain
+		if parent, err := h.pdns.GetZoneInfo(domain.RootDomain.Domain); err == nil {
+			status["parent_signed"] = parent.DNSsec
+		}
+	}
+
+	zone, err := h.pdns.GetZoneInfo(domain.FullDomain)
+	if err != nil || !zone.DNSsec {
+		return status
+	}
+	status["enabled"] = true
+
+	cryptoKeys, err := h.pdns.GetCryptoKeys(domain.FullDomain)
+	if err != nil {
+		return status
+	}
+	status["keys"] = dnssecKeyView(cryptoKeys)
+
+	if domain.RootDomain == nil {
+		return status
+	}
+	expected := map[string]bool{}
+	for _, k := range cryptoKeys {
+		if k.Active && k.Published {
+			for _, ds := range k.DS {
+				expected[strings.ToLower(strings.Join(strings.Fields(ds), " "))] = true
+			}
+		}
+	}
+	published, err := h.pdns.GetRRset(domain.RootDomain.Domain, domain.FullDomain, "DS")
+	if err != nil || len(published) == 0 || len(expected) == 0 {
+		return status
+	}
+	dsPublished := false
+	for _, r := range published {
+		if !r.Disabled && expected[strings.ToLower(strings.Join(strings.Fields(r.Content), " "))] {
+			dsPublished = true
+			break
+		}
+	}
+	status["ds_published"] = dsPublished
+	status["chain_valid"] = dsPublished && status["parent_signed"] == true
+	return status
+}
+
+// loadOwnedDomain 加载域名并校验所有权；失败时已写入响应
+func (h *DomainHandler) loadOwnedDomain(c *gin.Context) (*models.Domain, bool) {
+	userID, exists := middleware.GetUserID(c)
+	if !exists {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return nil, false
+	}
+
+	var domain models.Domain
+	if err := h.db.Preload("RootDomain").First(&domain, c.Param("id")).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Domain not found"})
+		return nil, false
+	}
+
+	if domain.UserID != userID {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Access denied"})
+		return nil, false
+	}
+	return &domain, true
+}
+
 // GetDomainDNSSEC 获取域名 DNSSEC 状态和密钥信息
 // @Summary 获取域名 DNSSEC 状态
 // @Tags Domain
@@ -630,52 +726,11 @@ func (h *DomainHandler) GetDomain(c *gin.Context) {
 // @Router /api/domains/{id}/dnssec [get]
 // @Security Bearer
 func (h *DomainHandler) GetDomainDNSSEC(c *gin.Context) {
-	userID, exists := middleware.GetUserID(c)
-	if !exists {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+	domain, ok := h.loadOwnedDomain(c)
+	if !ok {
 		return
 	}
-
-	var domain models.Domain
-	if err := h.db.Preload("RootDomain").First(&domain, c.Param("id")).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Domain not found"})
-		return
-	}
-
-	if domain.UserID != userID {
-		c.JSON(http.StatusForbidden, gin.H{"error": "Access denied"})
-		return
-	}
-
-	zone, err := h.pdns.GetZone(domain.FullDomain)
-	if err != nil {
-		c.JSON(http.StatusOK, gin.H{"enabled": false, "keys": []interface{}{}})
-		return
-	}
-
-	keys := []interface{}{}
-	if zone.DNSsec {
-		cryptoKeys, err := h.pdns.GetCryptoKeys(domain.FullDomain)
-		if err == nil {
-			for _, k := range cryptoKeys {
-				if k.Active && k.Published {
-					keys = append(keys, gin.H{
-						"id":        k.ID,
-						"keytype":   k.KeyType,
-						"algorithm": k.Algorithm,
-						"bits":      k.Bits,
-						"dnskey":    k.DNSKey,
-						"ds":        k.DS,
-					})
-				}
-			}
-		}
-	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"enabled": zone.DNSsec,
-		"keys":    keys,
-	})
+	c.JSON(http.StatusOK, h.domainDNSSECStatus(domain))
 }
 
 // EnableDomainDNSSEC 为域名启用 DNSSEC
@@ -687,43 +742,29 @@ func (h *DomainHandler) GetDomainDNSSEC(c *gin.Context) {
 // @Router /api/domains/{id}/dnssec/enable [post]
 // @Security Bearer
 func (h *DomainHandler) EnableDomainDNSSEC(c *gin.Context) {
-	userID, exists := middleware.GetUserID(c)
-	if !exists {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+	domain, ok := h.loadOwnedDomain(c)
+	if !ok {
+		return
+	}
+	if domain.RootDomain == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Parent zone not found"})
+		return
+	}
+	if !domain.UseDefaultNameservers {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "DNSSEC is managed by the custom nameserver provider"})
+		return
+	}
+	if domain.Status != "active" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "DNSSEC can only be enabled for active domains"})
 		return
 	}
 
-	var domain models.Domain
-	if err := h.db.Preload("RootDomain").First(&domain, c.Param("id")).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Domain not found"})
+	// A child zone is not reachable (and cannot form a DNSSEC chain) until its
+	// NS RRset is also published at the signed parent delegation point.
+	nameservers := ensureCanonicalNS([]string{h.cfg.DNS.DefaultNS1, h.cfg.DNS.DefaultNS2})
+	if err := h.pdns.EnsureDelegatedZone(domain.FullDomain, domain.RootDomain.Domain, nameservers); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to prepare delegated DNS zone: " + err.Error()})
 		return
-	}
-
-	if domain.UserID != userID {
-		c.JSON(http.StatusForbidden, gin.H{"error": "Access denied"})
-		return
-	}
-
-	// Ensure zone exists in PowerDNS before enabling DNSSEC
-	if _, err := h.pdns.GetZone(domain.FullDomain); err != nil {
-		// Zone doesn't exist — create it using the domain's nameservers
-		var nameservers []string
-		if domain.Nameservers != "" {
-			_ = json.Unmarshal([]byte(domain.Nameservers), &nameservers)
-		}
-		if len(nameservers) == 0 && domain.RootDomain != nil && domain.RootDomain.Nameservers != "" {
-			_ = json.Unmarshal([]byte(domain.RootDomain.Nameservers), &nameservers)
-		}
-		if len(nameservers) == 0 {
-			nameservers = []string{"ns1.example.com", "ns2.example.com"}
-		}
-		if createErr := h.pdns.CreateZone(domain.FullDomain, ensureCanonicalNS(nameservers)); createErr != nil {
-			// Ignore "already exists" errors
-			if !strings.Contains(createErr.Error(), "already exists") && !strings.Contains(createErr.Error(), "422") {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create DNS zone: " + createErr.Error()})
-				return
-			}
-		}
 	}
 
 	if err := h.pdns.EnableDNSSEC(domain.FullDomain); err != nil {
@@ -731,26 +772,19 @@ func (h *DomainHandler) EnableDomainDNSSEC(c *gin.Context) {
 		return
 	}
 
-	cryptoKeys, _ := h.pdns.GetCryptoKeys(domain.FullDomain)
-	keys := []interface{}{}
-	for _, k := range cryptoKeys {
-		if k.Active && k.Published {
-			keys = append(keys, gin.H{
-				"id":        k.ID,
-				"keytype":   k.KeyType,
-				"algorithm": k.Algorithm,
-				"bits":      k.Bits,
-				"dnskey":    k.DNSKey,
-				"ds":        k.DS,
-			})
-		}
+	// The parent zone is hosted here too, so the DS can be published right away.
+	// Without it the child stays "insecure" from a validator's point of view.
+	if err := h.pdns.PublishDSToParentZone(domain.FullDomain, domain.RootDomain.Domain); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "DNSSEC keys were created but publishing DS records to the parent zone failed: " + err.Error()})
+		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{
-		"message": "DNSSEC enabled successfully",
-		"enabled": true,
-		"keys":    keys,
-	})
+	status := h.domainDNSSECStatus(domain)
+	status["message"] = "DNSSEC enabled successfully"
+	if status["parent_signed"] != true {
+		status["warning"] = fmt.Sprintf("Parent zone %s is not DNSSEC signed yet; the chain of trust will be incomplete until it is", domain.RootDomain.Domain)
+	}
+	c.JSON(http.StatusOK, status)
 }
 
 // DisableDomainDNSSEC 为域名禁用 DNSSEC
@@ -762,41 +796,36 @@ func (h *DomainHandler) EnableDomainDNSSEC(c *gin.Context) {
 // @Router /api/domains/{id}/dnssec/disable [post]
 // @Security Bearer
 func (h *DomainHandler) DisableDomainDNSSEC(c *gin.Context) {
-	userID, exists := middleware.GetUserID(c)
-	if !exists {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+	domain, ok := h.loadOwnedDomain(c)
+	if !ok {
 		return
 	}
 
-	var domain models.Domain
-	if err := h.db.Preload("RootDomain").First(&domain, c.Param("id")).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Domain not found"})
-		return
+	// Break the chain at the parent before removing the child's signing key.
+	if domain.RootDomain != nil {
+		if err := h.pdns.UnpublishDSFromParentZone(domain.FullDomain, domain.RootDomain.Domain); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to remove parent DS records: " + err.Error()})
+			return
+		}
 	}
 
-	if domain.UserID != userID {
-		c.JSON(http.StatusForbidden, gin.H{"error": "Access denied"})
-		return
-	}
-
-	if err := h.pdns.DisableDNSSEC(domain.FullDomain); err != nil {
+	// A missing child zone (e.g. domain moved to custom nameservers) means
+	// there is nothing left to unsign.
+	if err := h.pdns.DisableDNSSEC(domain.FullDomain); err != nil && !powerdns.IsNotFound(err) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to disable DNSSEC: " + err.Error()})
 		return
 	}
 
-	// Remove DS records from parent zone if it's managed by us
-	if domain.RootDomain != nil {
-		_ = h.pdns.UnpublishDSFromParentZone(domain.FullDomain, domain.RootDomain.Domain)
-	}
-
 	c.JSON(http.StatusOK, gin.H{
-		"message": "DNSSEC disabled successfully",
-		"enabled": false,
-		"keys":    []interface{}{},
+		"message":      "DNSSEC disabled successfully",
+		"enabled":      false,
+		"keys":         []interface{}{},
+		"ds_published": false,
+		"chain_valid":  false,
 	})
 }
 
-// PublishDomainDSRecords 将子域名的 DS 记录发布到父 zone
+// PublishDomainDSRecords 将子域名的 DS 记录（重新）发布到父 zone
 // @Summary 发布 DS 记录到父 zone
 // @Tags Domain
 // @Produce json
@@ -805,25 +834,23 @@ func (h *DomainHandler) DisableDomainDNSSEC(c *gin.Context) {
 // @Router /api/domains/{id}/dnssec/publish-ds [post]
 // @Security Bearer
 func (h *DomainHandler) PublishDomainDSRecords(c *gin.Context) {
-	userID, exists := middleware.GetUserID(c)
-	if !exists {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
-		return
-	}
-
-	var domain models.Domain
-	if err := h.db.Preload("RootDomain").First(&domain, c.Param("id")).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Domain not found"})
-		return
-	}
-
-	if domain.UserID != userID {
-		c.JSON(http.StatusForbidden, gin.H{"error": "Access denied"})
+	domain, ok := h.loadOwnedDomain(c)
+	if !ok {
 		return
 	}
 
 	if domain.RootDomain == nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Parent zone not found"})
+		return
+	}
+	if !domain.UseDefaultNameservers {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "DNSSEC is managed by the custom nameserver provider"})
+		return
+	}
+
+	defaultNS := ensureCanonicalNS([]string{h.cfg.DNS.DefaultNS1, h.cfg.DNS.DefaultNS2})
+	if err := h.pdns.EnsureDelegatedZone(domain.FullDomain, domain.RootDomain.Domain, defaultNS); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to prepare delegated DNS zone: " + err.Error()})
 		return
 	}
 
@@ -832,9 +859,9 @@ func (h *DomainHandler) PublishDomainDSRecords(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{
-		"message": fmt.Sprintf("DS records published to %s successfully", domain.RootDomain.Domain),
-	})
+	status := h.domainDNSSECStatus(domain)
+	status["message"] = fmt.Sprintf("DS records published to %s successfully", domain.RootDomain.Domain)
+	c.JSON(http.StatusOK, status)
 }
 
 // DeleteDomain 删除域名
@@ -932,9 +959,7 @@ func (h *DomainHandler) ModifyNameservers(c *gin.Context) {
 
 	// 判断是否为默认 NS
 	defaultNS := []string{h.cfg.DNS.DefaultNS1, h.cfg.DNS.DefaultNS2}
-	isDefault := len(req.Nameservers) == 2 &&
-		req.Nameservers[0] == defaultNS[0] &&
-		req.Nameservers[1] == defaultNS[1]
+	isDefault := sameNameservers(req.Nameservers, defaultNS)
 
 	if err := h.db.Model(&domain).Updates(map[string]interface{}{
 		"nameservers":             string(nameserversJSON),
@@ -1737,6 +1762,110 @@ func (h *DomainHandler) DeleteRootDomain(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "Root domain deleted successfully"})
 }
 
+// rootDomainDNSSECStatus 汇总根域名 zone 的 DNSSEC 状态。
+// 根域名的 DS 需要由管理员手动配置到上级注册商，因此这里返回 DS 内容供复制。
+func (h *DomainHandler) rootDomainDNSSECStatus(rootDomain *models.RootDomain) gin.H {
+	status := gin.H{
+		"domain":      rootDomain.Domain,
+		"zone_exists": false,
+		"enabled":     false,
+		"keys":        []interface{}{},
+		"ds_records":  []string{},
+	}
+	zone, err := h.pdns.GetZoneInfo(rootDomain.Domain)
+	if err != nil {
+		return status
+	}
+	status["zone_exists"] = true
+	if !zone.DNSsec {
+		return status
+	}
+	status["enabled"] = true
+
+	cryptoKeys, err := h.pdns.GetCryptoKeys(rootDomain.Domain)
+	if err != nil {
+		return status
+	}
+	status["keys"] = dnssecKeyView(cryptoKeys)
+	ds := []string{}
+	for _, k := range cryptoKeys {
+		if k.Active && k.Published {
+			ds = append(ds, k.DS...)
+		}
+	}
+	status["ds_records"] = ds
+	return status
+}
+
+// GetRootDomainDNSSEC 管理员：获取根域名 DNSSEC 状态与 DS 记录
+func (h *DomainHandler) GetRootDomainDNSSEC(c *gin.Context) {
+	var rootDomain models.RootDomain
+	if err := h.db.First(&rootDomain, c.Param("id")).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Root domain not found"})
+		return
+	}
+	c.JSON(http.StatusOK, h.rootDomainDNSSECStatus(&rootDomain))
+}
+
+// EnableRootDomainDNSSEC 管理员：为根域名 zone 启用 DNSSEC。
+// 子域名的 DS 只有在根域名自身已签名、且根域名的 DS 已在注册商处配置时才能形成完整信任链。
+func (h *DomainHandler) EnableRootDomainDNSSEC(c *gin.Context) {
+	var rootDomain models.RootDomain
+	if err := h.db.First(&rootDomain, c.Param("id")).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Root domain not found"})
+		return
+	}
+	if !rootDomain.UseDefaultNameservers {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Root domain is served by external nameservers; DNSSEC must be configured there"})
+		return
+	}
+
+	var nameservers []string
+	if rootDomain.Nameservers != "" {
+		_ = json.Unmarshal([]byte(rootDomain.Nameservers), &nameservers)
+	}
+	if len(nameservers) == 0 {
+		nameservers = []string{h.cfg.DNS.DefaultNS1, h.cfg.DNS.DefaultNS2}
+	}
+	if err := h.pdns.EnsureZone(rootDomain.Domain, ensureCanonicalNS(nameservers)); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to prepare DNS zone: " + err.Error()})
+		return
+	}
+
+	if err := h.pdns.EnableDNSSEC(rootDomain.Domain); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to enable DNSSEC: " + err.Error()})
+		return
+	}
+
+	status := h.rootDomainDNSSECStatus(&rootDomain)
+	status["message"] = fmt.Sprintf("DNSSEC enabled for %s. Publish the DS records at your registrar to complete the chain of trust.", rootDomain.Domain)
+	c.JSON(http.StatusOK, status)
+}
+
+// DisableRootDomainDNSSEC 管理员：为根域名 zone 禁用 DNSSEC。
+// 调用前必须先在注册商处删除 DS 记录，否则整个根域名及其所有子域名都会解析失败。
+func (h *DomainHandler) DisableRootDomainDNSSEC(c *gin.Context) {
+	var rootDomain models.RootDomain
+	if err := h.db.First(&rootDomain, c.Param("id")).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Root domain not found"})
+		return
+	}
+
+	if err := h.pdns.DisableDNSSEC(rootDomain.Domain); err != nil && !powerdns.IsNotFound(err) {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to disable DNSSEC: " + err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message":     fmt.Sprintf("DNSSEC disabled for %s", rootDomain.Domain),
+		"domain":      rootDomain.Domain,
+		"zone_exists": true,
+		"enabled":     false,
+		"keys":        []interface{}{},
+		"ds_records":  []string{},
+	})
+}
+
 // ListDomainsByRootDomain 管理员：获取某个根域名下的所有域名
 func (h *DomainHandler) ListDomainsByRootDomain(c *gin.Context) {
 	rootDomainID := c.Param("id")
@@ -1867,36 +1996,16 @@ func (h *DomainHandler) AdminUpdateDomainStatus(c *gin.Context) {
 
 // deleteAllDNSRecordsForDomain 删除域名的所有 DNS 记录（从数据库和 PowerDNS）
 func (h *DomainHandler) deleteAllDNSRecordsForDomain(domain *models.Domain) error {
-	// 查询所有 DNS 记录
-	var records []models.DNSRecord
-	if err := h.db.Where("domain_id = ?", domain.ID).Find(&records).Error; err != nil {
-		return fmt.Errorf("failed to query DNS records: %w", err)
-	}
-
-	// 如果没有记录，直接返回
-	if len(records) == 0 {
-		return nil
-	}
-
-	// 如果有 RootDomain，从 PowerDNS 删除记录
+	// Delegation and zone cleanup must run even when the domain has no user
+	// records. Otherwise empty/stale zones and orphaned DS records accumulate.
 	if domain.RootDomain != nil {
-		zoneDomain := domain.RootDomain.Domain
-
-		// 按 name+type 分组记录，以便从 PowerDNS 删除
-		recordGroups := make(map[string]models.DNSRecord)
-		for _, record := range records {
-			key := fmt.Sprintf("%s|%s", record.Name, record.Type)
-			if _, exists := recordGroups[key]; !exists {
-				recordGroups[key] = record
-			}
+		if err := h.pdns.RemoveDelegation(domain.RootDomain.Domain, domain.FullDomain); err != nil {
+			return fmt.Errorf("failed to remove DNS delegation: %w", err)
 		}
-
-		// 删除每个 RRset
-		for _, record := range recordGroups {
-			recordFQDN := buildRecordFQDN(record.Name, domain.FullDomain)
-			if err := h.pdns.DeleteRRset(zoneDomain, recordFQDN, record.Type); err != nil {
-				fmt.Printf("Warning: Failed to delete RRset %s/%s from PowerDNS: %v\n", recordFQDN, record.Type, err)
-				// 继续删除其他记录
+		if domain.UseDefaultNameservers {
+			if err := h.pdns.DeleteZone(domain.FullDomain); err != nil &&
+				!strings.Contains(err.Error(), "not found") && !strings.Contains(err.Error(), "Could not find") {
+				return fmt.Errorf("failed to delete child DNS zone: %w", err)
 			}
 		}
 	}
@@ -2129,8 +2238,8 @@ func (h *DomainHandler) CleanupExpiredDomains(daysAfterExpiry int) {
 }
 
 // updateDomainNSRecordsInPowerDNS 更新域名在 PowerDNS root zone 中的 NS 记录
-// 当用户使用自定义 nameservers 时，需要在 root domain 的 zone 中添加该子域名的 NS 记录
-// 当用户切换回默认 NS 时，删除这些自定义 NS 记录，并为该子域名创建独立的 zone
+// 默认和自定义 nameservers 都必须在 root zone 中存在 NS 委派。
+// 默认 NS 另外由本 PowerDNS 实例托管独立的 child zone。
 func (h *DomainHandler) updateDomainNSRecordsInPowerDNS(domain *models.Domain, nameservers []string, isDefault bool) {
 	if domain.RootDomain == nil {
 		fmt.Printf("Warning: Cannot update NS records for domain %s: root domain not loaded\n", domain.FullDomain)
@@ -2140,32 +2249,25 @@ func (h *DomainHandler) updateDomainNSRecordsInPowerDNS(domain *models.Domain, n
 	rootDomain := domain.RootDomain.Domain
 	subdomainFQDN := domain.FullDomain
 
-	// 如果使用默认 NS，删除子域名的 NS 记录，并创建子域名的独立 zone
+	// 默认 NS：先确保 child zone 可提供权威应答，再发布父区委派。
 	if isDefault {
-		// 1. 删除在 root zone 中的 NS 记录
-		if err := h.pdns.DeleteRRset(rootDomain, subdomainFQDN, "NS"); err != nil {
-			fmt.Printf("Warning: Failed to delete NS records for %s in PowerDNS: %v\n", subdomainFQDN, err)
-		} else {
-			fmt.Printf("Deleted custom NS records for %s (using default NS)\n", subdomainFQDN)
+		defaultNS := ensureCanonicalNS([]string{h.cfg.DNS.DefaultNS1, h.cfg.DNS.DefaultNS2})
+		if err := h.pdns.EnsureDelegatedZone(subdomainFQDN, rootDomain, defaultNS); err != nil {
+			fmt.Printf("Warning: Failed to create delegated zone for %s in PowerDNS: %v\n", subdomainFQDN, err)
+			return
 		}
-
-		// 2. 为子域名创建独立的 zone
-		defaultNS := []string{h.cfg.DNS.DefaultNS1, h.cfg.DNS.DefaultNS2}
-		if err := h.pdns.CreateZone(subdomainFQDN, ensureCanonicalNS(defaultNS)); err != nil {
-			// 如果 zone 已经存在，不是错误
-			if !strings.Contains(err.Error(), "Conflict") && !strings.Contains(err.Error(), "already exists") {
-				fmt.Printf("Warning: Failed to create zone for %s in PowerDNS: %v\n", subdomainFQDN, err)
-			} else {
-				fmt.Printf("Zone for %s already exists in PowerDNS\n", subdomainFQDN)
-			}
-		} else {
-			fmt.Printf("Created zone for %s with default nameservers: %v\n", subdomainFQDN, defaultNS)
-		}
+		fmt.Printf("Ensured delegated zone for %s with default nameservers: %v\n", subdomainFQDN, defaultNS)
 		return
 	}
 
 	// 使用自定义 NS
-	// 1. 删除子域名的独立 zone（如果存在）
+	// 1. 先移除本地 child zone 的旧 DS，避免自定义服务被旧信任链标记为 BOGUS。
+	if err := h.pdns.UnpublishDSFromParentZone(subdomainFQDN, rootDomain); err != nil {
+		fmt.Printf("Warning: Failed to remove old DS records for %s: %v\n", subdomainFQDN, err)
+		return
+	}
+
+	// 2. 删除子域名的独立 zone（如果存在）
 	if err := h.pdns.DeleteZone(subdomainFQDN); err != nil {
 		// zone 不存在不是错误
 		if !strings.Contains(err.Error(), "not found") && !strings.Contains(err.Error(), "Could not find") {
@@ -2175,15 +2277,8 @@ func (h *DomainHandler) updateDomainNSRecordsInPowerDNS(domain *models.Domain, n
 		fmt.Printf("Deleted zone for %s (using custom NS)\n", subdomainFQDN)
 	}
 
-	// 2. 在 root domain zone 中添加子域名的 NS 记录
-	entries := make([]powerdns.RecordEntry, 0, len(nameservers))
-	for _, ns := range nameservers {
-		entries = append(entries, powerdns.RecordEntry{
-			Content: ns,
-		})
-	}
-
-	if err := h.pdns.SetRecords(rootDomain, subdomainFQDN, "NS", entries, 3600); err != nil {
+	// 3. 用自定义 NS 替换父区委派。
+	if err := h.pdns.SetDelegation(rootDomain, subdomainFQDN, ensureCanonicalNS(nameservers)); err != nil {
 		fmt.Printf("Warning: Failed to set NS records for %s in PowerDNS: %v\n", subdomainFQDN, err)
 	} else {
 		fmt.Printf("Updated NS records for %s with custom nameservers: %v\n", subdomainFQDN, nameservers)

@@ -43,6 +43,27 @@ func ensureCanonicalNS(nameservers []string) []string {
 	return canonical
 }
 
+// sameNameservers compares nameserver sets case-insensitively and ignores
+// presentation-only trailing dots and ordering.
+func sameNameservers(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	counts := make(map[string]int, len(left))
+	for _, ns := range left {
+		key := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(ns), "."))
+		counts[key]++
+	}
+	for _, ns := range right {
+		key := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(ns), "."))
+		if counts[key] == 0 {
+			return false
+		}
+		counts[key]--
+	}
+	return true
+}
+
 // ListRecords 获取域名的 DNS 记录列表
 func (h *DNSHandler) ListRecords(c *gin.Context) {
 	userID, exists := middleware.GetUserID(c)
@@ -536,7 +557,7 @@ func (h *DNSHandler) syncRecordSetToPowerDNS(record *models.DNSRecord, domain *m
 
 			// 使用默认 nameservers 创建 zone
 			defaultNS := []string{h.cfg.DNS.DefaultNS1, h.cfg.DNS.DefaultNS2}
-			if createErr := h.pdns.CreateZone(zoneDomain, ensureCanonicalNS(defaultNS)); createErr != nil {
+			if createErr := h.pdns.EnsureDelegatedZone(zoneDomain, domain.RootDomain.Domain, ensureCanonicalNS(defaultNS)); createErr != nil {
 				// 检查是否是因为zone已经存在（并发创建的情况）
 				if !strings.Contains(createErr.Error(), "Conflict") && !strings.Contains(createErr.Error(), "already exists") {
 					syncErr := fmt.Sprintf("Failed to create zone: %v", createErr)
@@ -550,11 +571,11 @@ func (h *DNSHandler) syncRecordSetToPowerDNS(record *models.DNSRecord, domain *m
 				}
 				fmt.Printf("Zone %s already exists (possible race condition), retrying...\n", zoneDomain)
 			} else {
-				fmt.Printf("Successfully created zone %s in PowerDNS\n", zoneDomain)
+				fmt.Printf("Successfully created delegated zone %s in PowerDNS\n", zoneDomain)
 			}
 
 			// 重试设置记录
-			err = h.pdns.SetRecords(zoneDomain, recordFQDN, record.Type, entries, record.TTL)
+			err = h.pdns.SetRecords(zoneDomain, recordFQDN, pdnsType, entries, record.TTL)
 		}
 
 		if err != nil {
@@ -652,7 +673,7 @@ func (h *DNSHandler) deleteRecordFromPowerDNS(record *models.DNSRecord, domain *
 
 				// 创建 zone（使用默认 NS）
 				defaultNS := []string{h.cfg.DNS.DefaultNS1, h.cfg.DNS.DefaultNS2}
-				if createErr := h.pdns.CreateZone(zoneDomain, ensureCanonicalNS(defaultNS)); createErr != nil {
+				if createErr := h.pdns.EnsureDelegatedZone(zoneDomain, domain.RootDomain.Domain, ensureCanonicalNS(defaultNS)); createErr != nil {
 					// 如果出现冲突错误，说明zone已被其他请求创建，这是正常的
 					if !strings.Contains(createErr.Error(), "Conflict") &&
 						!strings.Contains(createErr.Error(), "already exists") {
@@ -661,11 +682,11 @@ func (h *DNSHandler) deleteRecordFromPowerDNS(record *models.DNSRecord, domain *
 					}
 					fmt.Printf("Zone %s already exists (concurrent creation), proceeding with record update\n", zoneDomain)
 				} else {
-					fmt.Printf("Successfully created zone %s\n", zoneDomain)
+					fmt.Printf("Successfully created delegated zone %s\n", zoneDomain)
 				}
 
 				// 重试更新记录
-				err = h.pdns.SetRecords(zoneDomain, recordFQDN, record.Type, entries, remaining[0].TTL)
+				err = h.pdns.SetRecords(zoneDomain, recordFQDN, pdnsType, entries, remaining[0].TTL)
 				if err != nil {
 					fmt.Printf("Warning: Failed to update RRset in PowerDNS after zone creation: %v\n", err)
 				}
@@ -725,7 +746,7 @@ func (h *DNSHandler) SyncFromPowerDNS(c *gin.Context) {
 
 			// 使用默认 nameservers 创建 zone
 			defaultNS := []string{h.cfg.DNS.DefaultNS1, h.cfg.DNS.DefaultNS2}
-			if createErr := h.pdns.CreateZone(domain.FullDomain, ensureCanonicalNS(defaultNS)); createErr != nil {
+			if createErr := h.pdns.EnsureDelegatedZone(domain.FullDomain, domain.RootDomain.Domain, ensureCanonicalNS(defaultNS)); createErr != nil {
 				// 检查是否是因为zone已经存在（并发创建的情况）
 				if !strings.Contains(createErr.Error(), "Conflict") && !strings.Contains(createErr.Error(), "already exists") {
 					c.JSON(http.StatusInternalServerError, gin.H{
@@ -735,7 +756,7 @@ func (h *DNSHandler) SyncFromPowerDNS(c *gin.Context) {
 				}
 				fmt.Printf("Zone %s already exists (possible race condition), continuing...\n", domain.FullDomain)
 			} else {
-				fmt.Printf("Successfully created zone %s in PowerDNS\n", domain.FullDomain)
+				fmt.Printf("Successfully created delegated zone %s in PowerDNS\n", domain.FullDomain)
 			}
 
 			// 重新获取 zone 信息

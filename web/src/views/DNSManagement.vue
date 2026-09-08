@@ -43,6 +43,7 @@
               {{ dnssec.enabled ? $t('dnsManagement.dnssecEnabled') : $t('dnsManagement.dnssecDisabled') }}
             </span>
             <button
+              v-if="usesDefaultNS"
               @click="toggleDNSSEC"
               class="btn btn-sm"
               :class="dnssec.enabled ? 'btn-error' : 'btn-success'"
@@ -52,6 +53,24 @@
               <span v-else>{{ dnssec.enabled ? $t('dnsManagement.disableDNSSEC') : $t('dnsManagement.enableDNSSEC') }}</span>
             </button>
           </div>
+        </div>
+
+        <!-- Custom nameservers: DNSSEC lives at the provider -->
+        <div v-if="!usesDefaultNS" class="alert alert-info mt-3 text-sm">
+          <span>{{ $t('dnsManagement.dnssecCustomNS') }}</span>
+        </div>
+
+        <!-- Chain of trust status -->
+        <div v-else-if="dnssec.enabled" class="mt-3 flex flex-wrap gap-2 text-xs">
+          <span class="badge badge-sm" :class="dnssec.parentSigned ? 'badge-success' : 'badge-warning'">
+            {{ dnssec.parentSigned ? $t('dnsManagement.dnssecParentSigned', { zone: dnssec.parentZone }) : $t('dnsManagement.dnssecParentUnsigned', { zone: dnssec.parentZone }) }}
+          </span>
+          <span class="badge badge-sm" :class="dnssec.dsPublished ? 'badge-success' : 'badge-warning'">
+            {{ dnssec.dsPublished ? $t('dnsManagement.dnssecDSPublished') : $t('dnsManagement.dnssecDSMissing') }}
+          </span>
+          <span class="badge badge-sm" :class="dnssec.chainValid ? 'badge-success' : 'badge-ghost'">
+            {{ dnssec.chainValid ? $t('dnsManagement.dnssecChainValid') : $t('dnsManagement.dnssecChainIncomplete') }}
+          </span>
         </div>
 
         <!-- Keys Section -->
@@ -96,7 +115,7 @@
                 <svg v-else xmlns="http://www.w3.org/2000/svg" class="h-3 w-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                   <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" />
                 </svg>
-                {{ $t('dnsManagement.publishDSToParent') }}
+                {{ dnssec.dsPublished ? $t('dnsManagement.republishDSToParent') : $t('dnsManagement.publishDSToParent') }}
               </button>
             </div>
           </div>
@@ -339,7 +358,7 @@
 </template>
 
 <script setup>
-import { ref, onMounted } from 'vue'
+import { ref, computed, onMounted } from 'vue'
 import { useRoute } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import axios from '../utils/axios'
@@ -365,9 +384,24 @@ const errorCopied = ref(false)
 const dnssec = ref({
   enabled: false,
   keys: [],
+  parentZone: '',
+  parentSigned: false,
+  dsPublished: false,
+  chainValid: false,
   loading: false,
   publishingDS: false,
 })
+
+const usesDefaultNS = computed(() => domain.value?.use_default_nameservers !== false)
+
+const applyDNSSECStatus = (data) => {
+  dnssec.value.enabled = !!data.enabled
+  dnssec.value.keys = data.keys || []
+  dnssec.value.parentZone = data.parent_zone || dnssec.value.parentZone
+  dnssec.value.parentSigned = !!data.parent_signed
+  dnssec.value.dsPublished = !!data.ds_published
+  dnssec.value.chainValid = !!data.chain_valid
+}
 
 const form = ref({
   name: '@',
@@ -407,8 +441,7 @@ const fetchRecords = async () => {
 const fetchDNSSEC = async () => {
   try {
     const response = await axios.get(`/api/domains/${domainId}/dnssec`)
-    dnssec.value.enabled = response.data.enabled
-    dnssec.value.keys = response.data.keys || []
+    applyDNSSECStatus(response.data)
   } catch (error) {
     console.error('Failed to fetch DNSSEC status:', error)
   }
@@ -423,14 +456,15 @@ const toggleDNSSEC = async () => {
         return
       }
       const response = await axios.post(`/api/domains/${domainId}/dnssec/disable`)
-      dnssec.value.enabled = response.data.enabled
-      dnssec.value.keys = response.data.keys || []
+      applyDNSSECStatus(response.data)
       toast.success(t('dnsManagement.dnssecDisabledSuccess'))
     } else {
       const response = await axios.post(`/api/domains/${domainId}/dnssec/enable`)
-      dnssec.value.enabled = response.data.enabled
-      dnssec.value.keys = response.data.keys || []
+      applyDNSSECStatus(response.data)
       toast.success(t('dnsManagement.dnssecEnabledSuccess'))
+      if (response.data.warning) {
+        toast.warning(response.data.warning, 6000)
+      }
     }
   } catch (error) {
     toast.error(error.response?.data?.error || t('dnsManagement.dnssecOperationFailed'))
@@ -452,6 +486,7 @@ const publishDS = async () => {
   dnssec.value.publishingDS = true
   try {
     const response = await axios.post(`/api/domains/${domainId}/dnssec/publish-ds`)
+    applyDNSSECStatus(response.data)
     toast.success(response.data.message || t('dnsManagement.publishDSSuccess'))
   } catch (error) {
     toast.error(error.response?.data?.error || t('dnsManagement.publishDSFailed'))

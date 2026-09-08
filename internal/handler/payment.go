@@ -214,14 +214,14 @@ func (h *PaymentHandler) CompleteFreeOrder(c *gin.Context) {
 
 	tx.Commit()
 
-	// 如果域名使用自定义 nameservers，在 PowerDNS 中设置 NS 记录
+	// 在 PowerDNS 中创建/更新 child zone 与父区委派
 	if order.DomainID != nil {
 		var domain models.Domain
 		if err := h.db.Preload("RootDomain").First(&domain, *order.DomainID).Error; err == nil {
-			if !domain.UseDefaultNameservers && domain.RootDomain != nil {
+			if domain.RootDomain != nil {
 				var nameservers []string
 				if err := json.Unmarshal([]byte(domain.Nameservers), &nameservers); err == nil {
-					go h.updateDomainNSRecordsInPowerDNS(&domain, nameservers, false)
+					go h.updateDomainNSRecordsInPowerDNS(&domain, nameservers, domain.UseDefaultNameservers)
 				}
 			}
 		}
@@ -307,14 +307,14 @@ func (h *PaymentHandler) HandleCallback(c *gin.Context) {
 			return
 		}
 
-		// 如果域名使用自定义 nameservers，在 PowerDNS 中设置 NS 记录
+		// 在 PowerDNS 中创建/更新 child zone 与父区委派
 		if order.DomainID != nil {
 			var domain models.Domain
 			if err := h.db.Preload("RootDomain").First(&domain, *order.DomainID).Error; err == nil {
-				if !domain.UseDefaultNameservers && domain.RootDomain != nil {
+				if domain.RootDomain != nil {
 					var nameservers []string
 					if err := json.Unmarshal([]byte(domain.Nameservers), &nameservers); err == nil {
-						go h.updateDomainNSRecordsInPowerDNS(&domain, nameservers, false)
+						go h.updateDomainNSRecordsInPowerDNS(&domain, nameservers, domain.UseDefaultNameservers)
 					}
 				}
 			}
@@ -899,9 +899,9 @@ func (h *PaymentHandler) createDomainFromOrder(tx *gorm.DB, order *models.Order)
 			"dns_synced":              false,
 			"dns_sync_error":          nil,
 			// 清除历史挂起/失败记录，防止 scanner 按旧时间戳触发自动删除
-			"first_failed_at":         nil,
-			"suspended_at":            nil,
-			"suspend_reason":          nil,
+			"first_failed_at": nil,
+			"suspended_at":    nil,
+			"suspend_reason":  nil,
 		}).Error; restoreErr != nil {
 			return fmt.Errorf("failed to restore domain %s: %w", domain.FullDomain, restoreErr)
 		}
@@ -963,8 +963,7 @@ func (h *PaymentHandler) createDomainFromOrder(tx *gorm.DB, order *models.Order)
 }
 
 // updateDomainNSRecordsInPowerDNS 更新域名在 PowerDNS root zone 中的 NS 记录
-// 当用户使用自定义 nameservers 时，需要在 root domain 的 zone 中添加该子域名的 NS 记录
-// 当用户切换回默认 NS 时，删除这些自定义 NS 记录
+// 默认和自定义 nameservers 都必须同步到 root domain 的 NS 委派。
 func (h *PaymentHandler) updateDomainNSRecordsInPowerDNS(domain *models.Domain, nameservers []string, isDefault bool) {
 	if domain.RootDomain == nil {
 		fmt.Printf("Warning: Cannot update NS records for domain %s: root domain not loaded\n", domain.FullDomain)
@@ -974,25 +973,29 @@ func (h *PaymentHandler) updateDomainNSRecordsInPowerDNS(domain *models.Domain, 
 	rootDomain := domain.RootDomain.Domain
 	subdomainFQDN := domain.FullDomain
 
-	// 如果使用默认 NS，删除子域名的 NS 记录（让它继承 root domain 的 NS）
+	// 默认 NS 使用独立 child zone；PowerDNS 不会自动创建父区委派。
 	if isDefault {
-		if err := h.pdns.DeleteRRset(rootDomain, subdomainFQDN, "NS"); err != nil {
-			fmt.Printf("Warning: Failed to delete NS records for %s in PowerDNS: %v\n", subdomainFQDN, err)
-		} else {
-			fmt.Printf("Deleted custom NS records for %s (using default NS)\n", subdomainFQDN)
+		defaultNS := ensureCanonicalNS([]string{h.cfg.DNS.DefaultNS1, h.cfg.DNS.DefaultNS2})
+		if err := h.pdns.EnsureDelegatedZone(subdomainFQDN, rootDomain, defaultNS); err != nil {
+			fmt.Printf("Warning: Failed to create delegated zone for %s in PowerDNS: %v\n", subdomainFQDN, err)
+			return
 		}
+		fmt.Printf("Ensured delegated zone for %s with default nameservers: %v\n", subdomainFQDN, defaultNS)
 		return
 	}
 
-	// 使用自定义 NS，在 root domain zone 中添加子域名的 NS 记录
-	entries := make([]powerdns.RecordEntry, 0, len(nameservers))
-	for _, ns := range nameservers {
-		entries = append(entries, powerdns.RecordEntry{
-			Content: ns,
-		})
+	// 自定义 NS 不应继续保留本地 child zone 的 DS 或区域数据。
+	if err := h.pdns.UnpublishDSFromParentZone(subdomainFQDN, rootDomain); err != nil {
+		fmt.Printf("Warning: Failed to remove old DS records for %s: %v\n", subdomainFQDN, err)
+		return
+	}
+	if err := h.pdns.DeleteZone(subdomainFQDN); err != nil &&
+		!strings.Contains(err.Error(), "not found") && !strings.Contains(err.Error(), "Could not find") {
+		fmt.Printf("Warning: Failed to delete local zone for %s: %v\n", subdomainFQDN, err)
+		return
 	}
 
-	if err := h.pdns.SetRecords(rootDomain, subdomainFQDN, "NS", entries, 3600); err != nil {
+	if err := h.pdns.SetDelegation(rootDomain, subdomainFQDN, ensureCanonicalNS(nameservers)); err != nil {
 		fmt.Printf("Warning: Failed to set NS records for %s in PowerDNS: %v\n", subdomainFQDN, err)
 	} else {
 		fmt.Printf("Updated NS records for %s with custom nameservers: %v\n", subdomainFQDN, nameservers)

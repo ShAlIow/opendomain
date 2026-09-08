@@ -209,14 +209,6 @@ func strPtr(s string) *string {
 	return &s
 }
 
-// buildFQDN 构建 DNS 记录的 FQDN
-func buildFQDN(name, fullDomain string) string {
-	if name == "@" || name == "" {
-		return fullDomain
-	}
-	return name + "." + fullDomain
-}
-
 // deleteAbuseRecordsForDomain 删除滥用域名的所有 DNS 记录和 NS/Zone 记录
 // 同时清理 PowerDNS 中的 zone 或 NS 条目
 func (s *Scanner) deleteAbuseRecordsForDomain(domain *models.Domain) error {
@@ -239,42 +231,26 @@ func (s *Scanner) deleteAbuseRecordsForDomain(domain *models.Domain) error {
 	}
 
 	if len(records) > 0 {
-		// 按 name+type 分组，批量删除
-		recordGroups := make(map[string]models.DNSRecord)
-		for _, r := range records {
-			key := fmt.Sprintf("%s|%s", r.Name, r.Type)
-			if _, exists := recordGroups[key]; !exists {
-				recordGroups[key] = r
-			}
-		}
-		for _, r := range recordGroups {
-			fqdn := buildFQDN(r.Name, subdomainFQDN)
-			if err := s.pdns.DeleteRRset(rootDomain, fqdn, r.Type); err != nil {
-				fmt.Printf("[WARNING] Failed to delete RRset %s/%s for abused domain: %v\n", fqdn, r.Type, err)
-			}
-		}
 		if err := s.db.Where("domain_id = ?", domain.ID).Delete(&models.DNSRecord{}).Error; err != nil {
 			return fmt.Errorf("failed to delete DNS records from database: %w", err)
 		}
 		fmt.Printf("[INFO] Deleted %d DNS record(s) for abused domain %s\n", len(records), subdomainFQDN)
 	}
 
-	// 清理 PowerDNS 中的 Zone 或 NS 记录
+	// Always remove DS and NS from the signed parent. A child zone is not a
+	// replacement for an explicit parent delegation.
+	if err := s.pdns.RemoveDelegation(rootDomain, subdomainFQDN); err != nil {
+		return fmt.Errorf("failed to remove delegation for abused domain: %w", err)
+	}
+
+	// 清理 PowerDNS 中的 child zone
 	if domain.UseDefaultNameservers {
-		// 使用默认 NS：删除子域名独立 zone
 		if err := s.pdns.DeleteZone(subdomainFQDN); err != nil {
 			if !strings.Contains(err.Error(), "not found") && !strings.Contains(err.Error(), "Could not find") {
 				fmt.Printf("[WARNING] Failed to delete zone for abused domain %s: %v\n", subdomainFQDN, err)
 			}
 		} else {
 			fmt.Printf("[INFO] Deleted zone for abused domain %s\n", subdomainFQDN)
-		}
-	} else {
-		// 使用自定义 NS：删除在 root zone 中的 NS 记录
-		if err := s.pdns.DeleteRRset(rootDomain, subdomainFQDN, "NS"); err != nil {
-			fmt.Printf("[WARNING] Failed to delete NS records for abused domain %s: %v\n", subdomainFQDN, err)
-		} else {
-			fmt.Printf("[INFO] Deleted custom NS records for abused domain %s\n", subdomainFQDN)
 		}
 	}
 
