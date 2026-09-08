@@ -128,7 +128,8 @@ func (c *Client) SetDelegation(parentZone, childDomain string, nameservers []str
 
 	entries := make([]RecordEntry, 0, len(nameservers))
 	for _, ns := range nameservers {
-		if strings.TrimSpace(ns) == "" {
+		ns = strings.ToLower(strings.TrimSpace(ns))
+		if ns == "" {
 			return fmt.Errorf("cannot delegate %s to an empty nameserver", childDomain)
 		}
 		entries = append(entries, RecordEntry{Content: ensureTrailingDot(ns)})
@@ -587,7 +588,8 @@ func (c *Client) SetDelegations(parentZone string, delegations []Delegation) err
 		name := ensureTrailingDot(d.Child)
 		ns := make([]Record, 0, len(d.Nameservers))
 		for _, n := range d.Nameservers {
-			if strings.TrimSpace(n) == "" {
+			n = strings.ToLower(strings.TrimSpace(n))
+			if n == "" {
 				return fmt.Errorf("cannot delegate %s to an empty nameserver", d.Child)
 			}
 			ns = append(ns, Record{Content: ensureTrailingDot(n)})
@@ -604,13 +606,22 @@ func (c *Client) SetDelegations(parentZone string, delegations []Delegation) err
 		rrsets = append(rrsets, dsRRset)
 	}
 
+	// rrsets come in (NS, DS) pairs per delegation, so batches stay aligned.
+	var failures []error
 	for start := 0; start < len(rrsets); start += delegationBatchSize {
 		end := start + delegationBatchSize
 		if end > len(rrsets) {
 			end = len(rrsets)
 		}
-		if err := c.patchRRsets(zoneName, rrsets[start:end]); err != nil {
-			return fmt.Errorf("failed to publish delegations %d-%d in %s: %w", start, end, parentZone, err)
+		if err := c.patchRRsets(zoneName, rrsets[start:end]); err == nil {
+			continue
+		}
+		// One bad record fails the whole batch; retry each delegation on its
+		// own so a single invalid entry does not block the others.
+		for i := start; i < end; i += 2 {
+			if err := c.patchRRsets(zoneName, rrsets[i:i+2]); err != nil {
+				failures = append(failures, fmt.Errorf("%s: %w", strings.TrimSuffix(rrsets[i].Name, "."), err))
+			}
 		}
 	}
 	if len(rrsets) == 0 {
@@ -619,7 +630,25 @@ func (c *Client) SetDelegations(parentZone string, delegations []Delegation) err
 	if err := c.RectifyZone(parentZone); err != nil {
 		return fmt.Errorf("failed to rectify parent zone %s: %w", parentZone, err)
 	}
+	if len(failures) > 0 {
+		return &DelegationErrors{Parent: parentZone, Failures: failures}
+	}
 	return nil
+}
+
+// DelegationErrors reports the delegations that could not be published while
+// the rest of the batch succeeded.
+type DelegationErrors struct {
+	Parent   string
+	Failures []error
+}
+
+func (e *DelegationErrors) Error() string {
+	msgs := make([]string, 0, len(e.Failures))
+	for _, f := range e.Failures {
+		msgs = append(msgs, f.Error())
+	}
+	return fmt.Sprintf("%d delegation(s) failed in %s: %s", len(e.Failures), e.Parent, strings.Join(msgs, "; "))
 }
 
 // ensureTrailingDot 确保域名以点结尾

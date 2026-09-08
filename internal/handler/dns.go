@@ -3,6 +3,7 @@ package handler
 import (
 	"fmt"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -32,15 +33,50 @@ func NewDNSHandler(db *gorm.DB, cfg *config.Config) *DNSHandler {
 
 // ensureCanonicalNS 确保 nameserver 是规范格式（以 . 结尾）
 func ensureCanonicalNS(nameservers []string) []string {
-	canonical := make([]string, len(nameservers))
-	for i, ns := range nameservers {
-		if !strings.HasSuffix(ns, ".") {
-			canonical[i] = ns + "."
-		} else {
-			canonical[i] = ns
+	canonical := make([]string, 0, len(nameservers))
+	for _, ns := range nameservers {
+		ns = strings.ToLower(strings.TrimSpace(ns))
+		if ns == "" {
+			continue
 		}
+		if !strings.HasSuffix(ns, ".") {
+			ns += "."
+		}
+		canonical = append(canonical, ns)
 	}
 	return canonical
+}
+
+// nameserverHostnameRe matches a hostname made of DNS labels (RFC 1123) with
+// at least two labels; a trailing dot is stripped before matching.
+var nameserverHostnameRe = regexp.MustCompile(`^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
+
+// normalizeNameservers trims whitespace, lowercases, strips the trailing dot,
+// drops duplicates and rejects anything that is not a valid hostname. This is
+// the form stored in the database; PowerDNS refuses records with stray
+// whitespace such as "dns1.example.com\t.".
+func normalizeNameservers(nameservers []string) ([]string, error) {
+	seen := make(map[string]bool, len(nameservers))
+	out := make([]string, 0, len(nameservers))
+	for _, raw := range nameservers {
+		ns := strings.ToLower(strings.TrimSpace(raw))
+		ns = strings.TrimSuffix(ns, ".")
+		if ns == "" {
+			continue
+		}
+		if len(ns) > 253 || !nameserverHostnameRe.MatchString(ns) {
+			return nil, fmt.Errorf("invalid nameserver hostname: %q", strings.TrimSpace(raw))
+		}
+		if seen[ns] {
+			continue
+		}
+		seen[ns] = true
+		out = append(out, ns)
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("at least one nameserver is required")
+	}
+	return out, nil
 }
 
 // sameNameservers compares nameserver sets case-insensitively and ignores

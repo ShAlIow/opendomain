@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"net/http"
@@ -943,13 +944,13 @@ func (h *DomainHandler) ModifyNameservers(c *gin.Context) {
 		return
 	}
 
-	// 验证 nameservers 格式
-	for _, ns := range req.Nameservers {
-		if ns == "" {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "Nameserver cannot be empty"})
-			return
-		}
+	// 验证并规范化 nameservers（去空白、小写、去重、校验主机名）
+	normalized, err := normalizeNameservers(req.Nameservers)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
 	}
+	req.Nameservers = normalized
 
 	// 更新域名的 nameservers（存储为 JSON）
 	nameserversJSON, err := json.Marshal(req.Nameservers)
@@ -1571,7 +1572,12 @@ func (h *DomainHandler) CreateRootDomain(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "Nameservers required when not using default"})
 			return
 		}
-		nsBytes, err := json.Marshal(req.Nameservers)
+		normalized, err := normalizeNameservers(req.Nameservers)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		nsBytes, err := json.Marshal(normalized)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to encode nameservers"})
 			return
@@ -1704,7 +1710,12 @@ func (h *DomainHandler) UpdateRootDomain(c *gin.Context) {
 		} else {
 			// 如果切换到自定义 NS，需要提供 nameservers
 			if len(req.Nameservers) > 0 {
-				nsBytes, err := json.Marshal(req.Nameservers)
+				normalized, err := normalizeNameservers(req.Nameservers)
+				if err != nil {
+					c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+					return
+				}
+				nsBytes, err := json.Marshal(normalized)
 				if err != nil {
 					c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to encode nameservers"})
 					return
@@ -1970,11 +1981,12 @@ func (h *DomainHandler) runDelegationRepair(rootDomain models.RootDomain, domain
 			if d.Nameservers != "" {
 				_ = json.Unmarshal([]byte(d.Nameservers), &ns)
 			}
-			if len(ns) == 0 {
-				addError("%s uses custom nameservers but none are stored; skipped", d.FullDomain)
+			normalized, err := normalizeNameservers(ns)
+			if err != nil {
+				addError("%s: invalid custom nameservers %v (%v); skipped", d.FullDomain, ns, err)
 				continue
 			}
-			delegations = append(delegations, powerdns.Delegation{Child: d.FullDomain, Nameservers: ensureCanonicalNS(ns)})
+			delegations = append(delegations, powerdns.Delegation{Child: d.FullDomain, Nameservers: ensureCanonicalNS(normalized)})
 			continue
 		}
 
@@ -2002,14 +2014,24 @@ func (h *DomainHandler) runDelegationRepair(rootDomain models.RootDomain, domain
 		delegations = append(delegations, del)
 	}
 
+	failed := 0
 	if err := h.pdns.SetDelegations(rootDomain.Domain, delegations); err != nil {
-		addError("failed to publish delegations in %s: %v", rootDomain.Domain, err)
-		finish()
-		return
+		var partial *powerdns.DelegationErrors
+		if errors.As(err, &partial) {
+			// The rest of the batch was published; only report the bad ones.
+			failed = len(partial.Failures)
+			for _, f := range partial.Failures {
+				addError("%v", f)
+			}
+		} else {
+			addError("failed to publish delegations in %s: %v", rootDomain.Domain, err)
+			finish()
+			return
+		}
 	}
 
 	delegationRepairMu.Lock()
-	status.Delegated = len(delegations)
+	status.Delegated = len(delegations) - failed
 	for _, d := range delegations {
 		if len(d.DS) > 0 {
 			status.WithDS++
